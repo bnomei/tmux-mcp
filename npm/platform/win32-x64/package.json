@@ -1,0 +1,25 @@
+{
+  "name": "@bnomei/tmux-mcp-rs-win32-x64",
+  "version": "0.1.0",
+  "description": "Platform binary for tmux-mcp-rs (win32 x64)",
+  "license": "MIT",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "bin": {
+    "tmux-mcp-rs": "bin/tmux-mcp-rs.exe"
+  },
+  "files": [
+    "bin/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bnomei/tmux-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

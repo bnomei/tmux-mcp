@@ -1,0 +1,25 @@
+{
+  "name": "@bnomei/tmux-mcp-rs-darwin-arm64",
+  "version": "0.1.0",
+  "description": "Platform binary for tmux-mcp-rs (darwin arm64)",
+  "license": "MIT",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "bin": {
+    "tmux-mcp-rs": "bin/tmux-mcp-rs"
+  },
+  "files": [
+    "bin/"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bnomei/tmux-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

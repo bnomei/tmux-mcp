@@ -1,0 +1,66 @@
+#!/usr/bin/env node
+'use strict';
+
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const BIN_NAME = 'tmux-mcp-rs';
+const PKG_BASE = '@bnomei/tmux-mcp-rs';
+
+function resolvePlatformPackage() {
+  const platform = process.platform;
+  const arch = process.arch;
+
+  if (platform === 'linux' && arch === 'x64') return `${PKG_BASE}-linux-x64`;
+  if (platform === 'linux' && arch === 'arm64') return `${PKG_BASE}-linux-arm64`;
+  if (platform === 'darwin' && arch === 'x64') return `${PKG_BASE}-darwin-x64`;
+  if (platform === 'darwin' && arch === 'arm64') return `${PKG_BASE}-darwin-arm64`;
+  if (platform === 'win32' && arch === 'x64') return `${PKG_BASE}-win32-x64`;
+
+  return null;
+}
+
+function resolveBinaryPath(pkgName, exeName) {
+  const pkgJsonPath = require.resolve(`${pkgName}/package.json`);
+  const pkgRoot = path.dirname(pkgJsonPath);
+  return path.join(pkgRoot, 'bin', exeName);
+}
+
+function fail(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+const exeName = process.platform === 'win32' ? `${BIN_NAME}.exe` : BIN_NAME;
+
+if (process.env.TMUX_MCP_RS_LOCAL_BIN) {
+  const localPath = path.resolve(process.env.TMUX_MCP_RS_LOCAL_BIN);
+  if (!fs.existsSync(localPath)) {
+    fail(`Local binary not found: ${localPath}`);
+  }
+  const child = spawn(localPath, process.argv.slice(2), { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code ?? 1));
+  child.on('error', (err) => fail(`Failed to start ${BIN_NAME}: ${err.message}`));
+  return;
+}
+
+const pkgName = resolvePlatformPackage();
+if (!pkgName) {
+  fail(`Unsupported platform/arch: ${process.platform}/${process.arch}`);
+}
+
+let binPath;
+try {
+  binPath = resolveBinaryPath(pkgName, exeName);
+} catch (err) {
+  fail(`Missing optional dependency ${pkgName}. Reinstall the package on a supported platform.`);
+}
+
+if (!fs.existsSync(binPath)) {
+  fail(`Binary not found: ${binPath}`);
+}
+
+const child = spawn(binPath, process.argv.slice(2), { stdio: 'inherit' });
+child.on('exit', (code) => process.exit(code ?? 1));
+child.on('error', (err) => fail(`Failed to start ${BIN_NAME}: ${err.message}`));

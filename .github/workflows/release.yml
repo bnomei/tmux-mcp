@@ -1,0 +1,229 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BIN_NAME: tmux-mcp-rs
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            use_cross: true
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            use_cross: true
+          - os: macos-13
+            target: x86_64-apple-darwin
+            use_cross: false
+          - os: macos-14
+            target: aarch64-apple-darwin
+            use_cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            use_cross: false
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup cross
+        if: matrix.use_cross
+        uses: taiki-e/setup-cross@v1
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            version=$(python - <<'PY'
+import json, subprocess
+meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+print(meta["packages"][0]["version"])
+PY
+            )
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build (unix)
+        if: runner.os != 'Windows'
+        run: TARGET=${{ matrix.target }} scripts/build-release.sh
+
+      - name: Build (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/build-release.ps1 -Target ${{ matrix.target }}
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: TARGET=${{ matrix.target }} VERSION=${{ steps.version.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/package-release.ps1 -Target ${{ matrix.target }} -Version ${{ steps.version.outputs.version }} -BinName ${{ env.BIN_NAME }}
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+      - name: Upload GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+
+  npm-publish:
+    name: Publish npm packages
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ secrets.NPM_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            version=$(python - <<'PY'
+import json, subprocess
+meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
+print(meta["packages"][0]["version"])
+PY
+            )
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sync npm package versions
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const version = process.env.VERSION;
+          const basePath = path.join('npm', 'base', 'package.json');
+          const base = JSON.parse(fs.readFileSync(basePath, 'utf8'));
+          base.version = version;
+          if (base.optionalDependencies) {
+            for (const name of Object.keys(base.optionalDependencies)) {
+              base.optionalDependencies[name] = version;
+            }
+          }
+          fs.writeFileSync(basePath, JSON.stringify(base, null, 2) + '\n');
+          const platformRoot = path.join('npm', 'platform');
+          for (const entry of fs.readdirSync(platformRoot, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            const pkgPath = path.join(platformRoot, entry.name, 'package.json');
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = version;
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          }
+          NODE
+
+      - name: Stage platform binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BIN_NAME: ${{ env.BIN_NAME }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cp README.md npm/base/README.md
+          cp LICENSE npm/base/LICENSE
+
+          platform_dirs=(npm/platform/*)
+          if [[ ${#platform_dirs[@]} -eq 0 ]]; then
+            echo "No npm/platform/* directories found." >&2
+            exit 1
+          fi
+
+          for dir in "${platform_dirs[@]}"; do
+            mkdir -p "$dir/bin"
+            cp README.md "$dir/README.md"
+            cp LICENSE "$dir/LICENSE"
+          done
+
+          declare -A map
+          map[x86_64-unknown-linux-musl]=linux-x64
+          map[aarch64-unknown-linux-musl]=linux-arm64
+          map[x86_64-apple-darwin]=darwin-x64
+          map[aarch64-apple-darwin]=darwin-arm64
+          map[x86_64-pc-windows-msvc]=win32-x64
+
+          for target in "${!map[@]}"; do
+            package_dir="npm/platform/${map[$target]}"
+            archive=$(find dist -type f -name "${BIN_NAME}-v${VERSION}-${target}.*" -print -quit)
+            if [[ -z "$archive" ]]; then
+              echo "Missing archive for target ${target}" >&2
+              exit 1
+            fi
+            if [[ "$archive" == *.zip ]]; then
+              unzip -j "$archive" -d "$package_dir/bin"
+            else
+              tar -xzf "$archive" -C "$package_dir/bin"
+            fi
+          done
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in npm/platform/*; do
+            npm publish --access public "$dir"
+          done
+
+      - name: Publish base package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public npm/base
+
+  cargo-publish:
+    name: Publish crate
+    runs-on: ubuntu-latest
+    needs: build
+    if: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
