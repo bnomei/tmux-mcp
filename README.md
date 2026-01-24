@@ -25,19 +25,29 @@ Requires tmux installed and available on `PATH`.
 cargo install tmux-mcp-rs
 ```
 
-### Homebrew
+### Homebrew (soon)
 ```bash
 brew install bnomei/tmux-mcp/tmux-mcp-rs
 ```
 
-### npm
+### npm (soon)
 ```bash
 npm install -g @bnomei/tmux-mcp-rs
 ```
 
-### npx (no install)
+### npx (no install) (soon)
 ```bash
 npx -y @bnomei/tmux-mcp-rs@latest
+```
+
+### GitHub Releases (soon)
+Download a prebuilt archive from the GitHub Releases page, extract it, and place `tmux-mcp-rs` on your `PATH`.
+
+### From source
+```bash
+git clone https://github.com/bnomei/tmux-mcp.git
+cd tmux-mcp
+cargo build --release
 ```
 
 ## Quick Start
