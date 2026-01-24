@@ -54,31 +54,31 @@ pub struct ExecuteCommandOutput {
 }
 
 /// Output payload for the list-sessions tool.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListSessionsOutput {
     pub sessions: Vec<Session>,
 }
 
 /// Output payload for the list-windows tool.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListWindowsOutput {
     pub windows: Vec<Window>,
 }
 
 /// Output payload for the list-panes tool.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListPanesOutput {
     pub panes: Vec<Pane>,
 }
 
 /// Output payload for the list-clients tool.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListClientsOutput {
     pub clients: Vec<ClientInfo>,
 }
 
 /// Output payload for the list-buffers tool.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ListBuffersOutput {
     pub buffers: Vec<BufferInfo>,
 }
@@ -2493,7 +2493,7 @@ mod tests {
     use super::*;
     use crate::test_support::TmuxStub;
     use crate::types::ShellType;
-    use crate::types::{BufferInfo, ClientInfo, Pane, Session, Window};
+    use crate::types::{Pane, Session, Window};
     use rmcp::model::{NumberOrString, ReadResourceRequestParams, ResourceContents};
     use rmcp::service::{self, RequestContext, RoleServer};
     use rmcp::ServerHandler;
