@@ -55,12 +55,7 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            version=$(python - <<'PY'
-import json, subprocess
-meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
-print(meta["packages"][0]["version"])
-PY
-            )
+            version=$(python -c 'import json, subprocess; meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"])); print(meta["packages"][0]["version"])')
             echo "version=${version}" >> "$GITHUB_OUTPUT"
           fi
 
@@ -119,12 +114,7 @@ PY
           if [[ "${GITHUB_REF_NAME}" == v* ]]; then
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
           else
-            version=$(python - <<'PY'
-import json, subprocess
-meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"]))
-print(meta["packages"][0]["version"])
-PY
-            )
+            version=$(python -c 'import json, subprocess; meta = json.loads(subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"])); print(meta["packages"][0]["version"])')
             echo "version=${version}" >> "$GITHUB_OUTPUT"
           fi
 
