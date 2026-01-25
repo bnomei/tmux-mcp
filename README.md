@@ -84,6 +84,23 @@ amp mcp add tmux -- tmux-mcp-rs
 tmux attach -t <session>
 ```
 
+## Workflow Patterns (CLI Agents)
+
+These patterns mirror how CLI agents like Codex can structure tmux work. Each is backed by an integration test in `tests/integration.rs` (run with `TMUX_MCP_INTEGRATION=1`).
+
+- **ID-first targeting**: Use window/pane IDs for operations when names collide. Tools: list-windows/list-panes, rename-window. Test: `test_workflow_id_first_targeting`.
+- **Task-per-session layout**: Create a session per task, add windows for build/test/docs, and split panes for runners/logs. Tools: create-session, create-window, split-pane, rename-pane, list-windows, list-panes. Test: `test_workflow_task_per_session_layout`.
+- **Stateful shell context**: Set environment/state in a pane and reuse it across commands. Tools: send-keys, capture-pane. Test: `test_workflow_stateful_shell_context`.
+- **Continuous output pane**: Run a long command and poll `capture-pane` to summarize progress without losing terminal state. Tools: send-keys, capture-pane. Test: `test_workflow_continuous_output_capture`.
+- **Interactive prompt automation**: Drive a blocking prompt (or simple TUI) by sending responses via keys, then capture the result. Tools: send-keys, capture-pane. Test: `test_workflow_interactive_prompt`.
+- **Interactive interrupts**: Cancel long-running commands and end stdin streams with EOF. Tools: send-cancel, send-eof, capture-pane. Test: `test_workflow_interactive_interrupts`.
+- **Synchronized panes broadcast**: Fan out a command to multiple panes at once using synchronize-panes. Tools: set-synchronize-panes, send-keys, capture-pane. Test: `test_workflow_synchronized_panes_broadcast`.
+- **Buffer handoff**: Stash output in buffers, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer. Test: `test_workflow_buffer_roundtrip`.
+- **Pane rearrangements**: Swap/break/join panes and apply layouts while preserving pane identities. Tools: split-pane, select-layout, swap-pane, break-pane, join-pane, list-panes, list-windows. Test: `test_workflow_pane_rearrangements`.
+- **Metadata + zoom**: Rename session/window/pane and inspect pane/window metadata; toggle zoom and resize. Tools: rename-session, rename-window, rename-pane, zoom-pane, resize-pane. Resources: `tmux://pane/{paneId}/info`, `tmux://window/{windowId}/info`. Test: `test_workflow_metadata_and_zoom`.
+- **Audit-ready context bundle**: Pair tracked command output with raw pane capture for traceability. Tools: execute-command, get-command-result, capture-pane. Test: `test_workflow_audit_context_bundle`.
+- **Agent orchestration**: Run parallel commands across windows/panes with log monitoring. Tools: create-window, split-pane, execute-command, send-keys, capture-pane. Test: `test_workflow_agent_orchestration`.
+
 ## Usage
 
 ### MCP Configuration
@@ -109,24 +126,6 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
   }
 }
 ```
-
-## Workflow Patterns (CLI Agents)
-
-These patterns mirror how CLI agents like Codex can structure tmux work. Each is backed by an integration test in `tests/integration.rs` (run with `TMUX_MCP_INTEGRATION=1`).
-
-- **ID-first targeting**: Use window/pane IDs for operations when names collide. Tools: list-windows/list-panes, rename-window. Test: `test_workflow_id_first_targeting`.
-- **Task-per-session layout**: Create a session per task, add windows for build/test/docs, and split panes for runners/logs. Tools: create-session, create-window, split-pane, rename-pane, list-windows, list-panes. Test: `test_workflow_task_per_session_layout`.
-- **Stateful shell context**: Set environment/state in a pane and reuse it across commands. Tools: send-keys, capture-pane. Test: `test_workflow_stateful_shell_context`.
-- **Continuous output pane**: Run a long command and poll `capture-pane` to summarize progress without losing terminal state. Tools: send-keys, capture-pane. Test: `test_workflow_continuous_output_capture`.
-- **Interactive prompt automation**: Drive a blocking prompt (or simple TUI) by sending responses via keys, then capture the result. Tools: send-keys, capture-pane. Test: `test_workflow_interactive_prompt`.
-- **Interactive interrupts**: Cancel long-running commands and end stdin streams with EOF. Tools: send-cancel, send-eof, capture-pane. Test: `test_workflow_interactive_interrupts`.
-- **Synchronized panes broadcast**: Fan out a command to multiple panes at once using synchronize-panes. Tools: set-synchronize-panes, send-keys, capture-pane. Test: `test_workflow_synchronized_panes_broadcast`.
-- **Buffer handoff**: Stash output in buffers, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer. Test: `test_workflow_buffer_roundtrip`.
-- **Pane rearrangements**: Swap/break/join panes and apply layouts while preserving pane identities. Tools: split-pane, select-layout, swap-pane, break-pane, join-pane, list-panes, list-windows. Test: `test_workflow_pane_rearrangements`.
-- **Metadata + zoom**: Rename session/window/pane and inspect pane/window metadata; toggle zoom and resize. Tools: rename-session, rename-window, rename-pane, zoom-pane, resize-pane. Resources: `tmux://pane/{paneId}/info`, `tmux://window/{windowId}/info`. Test: `test_workflow_metadata_and_zoom`.
-- **Audit-ready context bundle**: Pair tracked command output with raw pane capture for traceability. Tools: execute-command, get-command-result, capture-pane. Test: `test_workflow_audit_context_bundle`.
-- **Agent orchestration**: Run parallel commands across windows/panes with log monitoring. Tools: create-window, split-pane, execute-command, send-keys, capture-pane. Test: `test_workflow_agent_orchestration`.
-
 
 ### CLI Options
 
