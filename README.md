@@ -185,7 +185,7 @@ patterns = []
 - **split-pane** - Split a pane horizontally or vertically
 - **kill-pane** - Kill a pane (closing the last pane also closes its window)
 - **rename-pane** - Set pane title
-- **capture-pane** - Capture pane content
+- **capture-pane** - Capture pane content (state/logs; not for routine command output)
 - **select-pane** - Select/focus a pane
 - **resize-pane** - Resize a pane by direction or size
 - **zoom-pane** - Toggle pane zoom
@@ -194,8 +194,8 @@ patterns = []
 - **swap-pane** - Swap two panes
 
 ### Command Execution
-- **execute-command** - Execute a command in a pane
-- **get-command-result** - Get the result of an executed command
+- **execute-command** - Execute a command in a pane (preferred for non-interactive)
+- **get-command-result** - Get the result of an executed command (preferred output path)
 
 ### Client Management
 - **list-clients** - List tmux clients
@@ -208,11 +208,11 @@ patterns = []
 - **delete-buffer** - Delete a buffer
 
 ### Key Sending
-- **send-keys** - Send arbitrary keys to a pane
+- **send-keys** - Send arbitrary keys to a pane (interactive only)
 - **send-cancel** - Send Ctrl+C
 - **send-eof** - Send Ctrl+D (EOF)
 - **send-escape** - Send Escape key
-- **send-enter** - Send Enter key
+- **send-enter** - Send Enter key (interactive prompts)
 - **send-tab** - Send Tab key
 - **send-backspace** - Send Backspace key
 

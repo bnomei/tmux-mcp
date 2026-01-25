@@ -645,7 +645,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "capture-pane",
-        description = "Read screen content and scrollback from a pane. Returns plain text of pane contents. Use to check state, tail logs, or verify interactive steps; for deterministic command output prefer execute-command + get-command-result.",
+        description = "Read screen content and scrollback from a pane. Returns plain text of pane contents. Use to check state, tail logs, or verify interactive steps; avoid send-keys+send-enter+capture-pane for routine command output; prefer execute-command + get-command-result.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn capture_pane(
@@ -935,7 +935,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "execute-command",
-        description = "Run a shell command in a pane with exit-code tracking. Returns JSON: {commandId, status, message}. Use for non-interactive commands that terminate; for pipes/quotes, wrap with `sh -lc '...'`. Poll with get-command-result, and use capture-pane only if you need live progress. For interactive programs (vim/htop), use send-keys instead.",
+        description = "Run a shell command in a pane with exit-code tracking. Returns JSON: {commandId, status, message}. Preferred for non-interactive commands; for pipes/quotes, wrap with `sh -lc '...'`. Poll with get-command-result, and use capture-pane only if you need live progress. For interactive programs (vim/htop), use send-keys instead.",
         annotations(open_world_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<ExecuteCommandOutput>()
     )]
@@ -990,7 +990,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "get-command-result",
-        description = "Check the status and output of a tracked command by its ID. Returns JSON: {status, exitCode?, command, output?}. Use to poll command completion after execute-command; if status stays pending, switch to capture-pane for live output.",
+        description = "Check the status and output of a tracked command by its ID. Returns JSON: {status, exitCode?, command, output?}. Preferred for command output after execute-command; if status stays pending, switch to capture-pane for live output.",
         annotations(read_only_hint = true, idempotent_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<GetCommandResultOutput>()
     )]
@@ -1513,7 +1513,7 @@ impl TmuxMcpServer {
     // Dedicated terminal interaction tools
     #[tool(
         name = "send-keys",
-        description = "Send keystrokes to a pane. Use to drive interactive programs (vim/htop/ssh/REPLs); for deterministic commands prefer execute-command. Pair with capture-pane in a read-act loop. Use literal=true for exact text, delayMs for slow terminals.",
+        description = "Send keystrokes to a pane. Use only for interactive programs (vim/htop/ssh/REPLs); for commands prefer execute-command + get-command-result instead of send-keys+send-enter+capture-pane. Pair with capture-pane in a read-act loop. Use literal=true for exact text, delayMs for slow terminals.",
         annotations(open_world_hint = true)
     )]
     async fn send_keys(
@@ -1636,7 +1636,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "send-enter",
-        description = "Send Enter key to a pane. Use to submit a command or confirm a prompt after send-keys in interactive flows.",
+        description = "Send Enter key to a pane. Use to confirm prompts after send-keys in interactive flows; for commands prefer execute-command.",
         annotations(open_world_hint = true)
     )]
     async fn send_enter(&self, input: Parameters<PaneIdInput>) -> Result<CallToolResult, McpError> {
