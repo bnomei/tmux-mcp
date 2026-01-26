@@ -571,9 +571,7 @@ fn clamp_char_boundary(text: &str, idx: usize, forward: bool) -> usize {
 // rapidfuzz (feature-gated) provides fuzzy similarity scoring when requested.
 #[cfg(feature = "rapidfuzz")]
 fn similarity_score(query: &str, matched: &str) -> f32 {
-    rapidfuzz::fuzz::ratio(query.chars(), matched.chars(), None, None)
-        .unwrap_or(0.0)
-        .clamp(0.0, 1.0) as f32
+    rapidfuzz::fuzz::ratio(query.chars(), matched.chars()).clamp(0.0, 1.0) as f32
 }
 
 #[cfg(not(feature = "rapidfuzz"))]
