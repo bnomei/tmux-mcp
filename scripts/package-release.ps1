@@ -13,15 +13,20 @@ if (-not (Test-Path $binPath)) {
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$outDirFull = (Resolve-Path $OutDir).Path
 
 $archiveName = "$BinName-v$Version-$Target.zip"
-$archivePath = Join-Path $OutDir $archiveName
+$archivePath = Join-Path $outDirFull $archiveName
 
+$tempDir = Join-Path $env:TEMP ("tmux-mcp-rs-" + [Guid]::NewGuid().ToString())
+New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 try {
-  Push-Location (Split-Path -Parent $binPath)
+  Copy-Item -Path $binPath -Destination (Join-Path $tempDir "$BinName.exe") -Force
+  Push-Location $tempDir
   Compress-Archive -Path "$BinName.exe" -DestinationPath $archivePath -Force
 } finally {
   Pop-Location
+  Remove-Item -Recurse -Force $tempDir
 }
 
 $hashPath = "$archivePath.sha256"
