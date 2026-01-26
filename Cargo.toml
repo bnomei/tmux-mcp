@@ -1,6 +1,6 @@
 [package]
 name = "tmux-mcp-rs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Tmux MCP server in Rust"
 readme = "README.md"
@@ -43,7 +43,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 shell-words = "1"
 tempfile = "3"
 rayon = { version = "1", optional = true }
-rapidfuzz = { version = "0.3", optional = true }
+rapidfuzz = { version = "0.5", optional = true }
 
 [dev-dependencies]
 rstest = "0.26"
