@@ -79,7 +79,7 @@ case "$cmd" in
   break-pane)
     printf '%b' "${TMUX_STUB_BREAK_PANE_OUTPUT:-@9\tbroken\t1\t%1}"
     ;;
-  send-keys|kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer)
+  send-keys|kill-session|kill-window|kill-pane|rename-window|rename-pane|rename-session|move-window|select-pane|select-window|select-layout|join-pane|swap-pane|resize-pane|set-option|detach-client|save-buffer|delete-buffer|set-buffer|load-buffer)
     ;;
   *)
     echo "unknown command: $cmd" 1>&2

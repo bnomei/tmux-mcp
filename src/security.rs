@@ -176,9 +176,9 @@ impl SecurityPolicy {
             | "break-pane"
             | "swap-pane"
             | "set-synchronize-panes" => self.config.allow_move,
-            "capture-pane" | "show-buffer" | "save-buffer" | "delete-buffer" => {
-                self.config.allow_capture
-            }
+            "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
+            | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
+            | "subsearch-buffer" => self.config.allow_capture,
             "list-sessions"
             | "list-windows"
             | "list-panes"

@@ -95,7 +95,7 @@ These patterns mirror how CLI agents like Codex can structure tmux work. Each is
 - **Interactive prompt automation**: Drive a blocking prompt (or simple TUI) by sending responses via keys, then capture the result. Tools: send-keys, capture-pane. Test: `test_workflow_interactive_prompt`.
 - **Interactive interrupts**: Cancel long-running commands and end stdin streams with EOF. Tools: send-cancel, send-eof, capture-pane. Test: `test_workflow_interactive_interrupts`.
 - **Synchronized panes broadcast**: Fan out a command to multiple panes at once using synchronize-panes. Tools: set-synchronize-panes, send-keys, capture-pane. Test: `test_workflow_synchronized_panes_broadcast`.
-- **Buffer handoff**: Stash output in buffers, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer. Test: `test_workflow_buffer_roundtrip`.
+- **Buffer handoff + probe**: Stash output in buffers, optionally search/subsearch for targeted slices, save to disk, and delete when done. Tools: list-buffers, show-buffer, save-buffer, delete-buffer, search-buffer, subsearch-buffer. Test: `test_workflow_buffer_roundtrip` (core flow).
 - **Pane rearrangements**: Swap/break/join panes and apply layouts while preserving pane identities. Tools: split-pane, select-layout, swap-pane, break-pane, join-pane, list-panes, list-windows. Test: `test_workflow_pane_rearrangements`.
 - **Metadata + zoom**: Rename session/window/pane and inspect pane/window metadata; toggle zoom and resize. Tools: rename-session, rename-window, rename-pane, zoom-pane, resize-pane. Resources: `tmux://pane/{paneId}/info`, `tmux://window/{windowId}/info`. Test: `test_workflow_metadata_and_zoom`.
 - **Audit-ready context bundle**: Pair tracked command output with raw pane capture for traceability. Tools: execute-command, get-command-result, capture-pane. Test: `test_workflow_audit_context_bundle`.
@@ -202,9 +202,40 @@ patterns = []
 
 ### Buffer Management
 - **list-buffers** - List tmux paste buffers
-- **show-buffer** - Show buffer contents
+- **show-buffer** - Show buffer contents (supports offset/max bytes; defaults to 64KB)
 - **save-buffer** - Save buffer contents to a file
 - **delete-buffer** - Delete a buffer
+
+### Additional Buffer Tools
+These tools extend tmux’s native buffers for the probe‑and‑refine workflow described in the paper (https://arxiv.org/pdf/2512.24601), while keeping all state inside tmux. They’re general-purpose building blocks used by the coordinating Skill at `skills/tmux-buffer-explorer/SKILL.md`.
+- **set-buffer** - Create or replace a buffer with UTF-8 content
+- **load-buffer** - Load buffer contents from a file
+- **append-buffer** - Append UTF-8 content to an existing buffer
+- **rename-buffer** - Emulate rename by copying then deleting
+- **search-buffer** - Structured search over one or more buffers (literal/regex + metadata)
+- **subsearch-buffer** - Anchor-scoped follow-up search with structured metadata
+
+> [!TIP]
+> **Q:** Use the tmux buffer to search the tests/fixtures/old-man-and-the-sea.txt (133,351 bytes) for
+  baseball near dimago.
+> **Q:** Where does the old man talk about why he admires DiMaggio, and what reason does he
+  give?
+> **Q:** Where does the old man reflect on his loneliness at sea, and how does that reflection change later in the story?
+> **Q:** Find the passage where the lions are mentioned most vividly and summarize what they symbolize.
+> **Q:** Locate the moment where the old man’s confidence shifts into doubt during the fight with the fish.
+> **A:** In tmux buffer oldman around byte offset ~56320 (mid‑fight, when his left hand
+  cramps), he asserts he can handle the line with his right arm alone, then
+  immediately says he doesn’t know what the fish will do and starts questioning the
+  fish’s plan and his own. That’s the confidence‑to‑doubt shift.
+
+The tmux buffer search is **not intended to replace ripgrep**. `rg` is a high-performance, one-shot search tool optimized for humans who already know what they are looking for. This project targets a different problem: enabling **LLM agents to explore large contexts incrementally**.
+
+Search here is a **navigation primitive**, not an end result. It provides:
+- structured results with stable offsets and match IDs
+- bounded, zoom-able reads for follow-up inspection
+- deterministic behavior across multiple reasoning steps
+
+This aligns with the *Recursive Language Models* approach: treat context as an **external environment to explore**, not a blob to ingest. Performance is more than sufficient for buffer-scale text, and the dominant cost is agent reasoning, not scanning. If needed, faster backends (including `rg`) can be added later behind the same interface.
 
 ### Key Sending
 - **send-keys** - Send arbitrary keys to a pane (interactive only)

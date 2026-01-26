@@ -1,6 +1,6 @@
 [package]
 name = "tmux-mcp-rs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Tmux MCP server in Rust"
 readme = "README.md"
@@ -20,6 +20,12 @@ path = "src/lib.rs"
 name = "tmux-mcp-rs"
 path = "src/main.rs"
 
+[features]
+default = ["rayon", "rapidfuzz"]
+rayon = ["dep:rayon"]
+rapidfuzz = ["dep:rapidfuzz"]
+fuzzy = ["rapidfuzz"]
+
 [dependencies]
 rmcp = { version = "0.14", default-features = false, features = ["server", "transport-io", "macros", "base64"] }
 tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -35,7 +41,9 @@ once_cell = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "registry", "std"] }
 shell-words = "1"
+tempfile = "3"
+rayon = { version = "1", optional = true }
+rapidfuzz = { version = "0.3", optional = true }
 
 [dev-dependencies]
 rstest = "0.26"
-tempfile = "3"

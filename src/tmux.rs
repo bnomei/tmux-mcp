@@ -1,9 +1,68 @@
 #![allow(dead_code)]
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::process::Stdio;
+
+use once_cell::sync::Lazy;
+use regex::Regex;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 
 use crate::errors::{Error, Result};
-use crate::types::{BufferInfo, ClientInfo, Pane, PaneInfo, Session, Window, WindowInfo};
+use crate::types::{
+    BufferInfo, BufferSearchMatch, BufferSearchOutput, ClientInfo, Pane, PaneInfo, SearchMode,
+    Session, Window, WindowInfo,
+};
+
+const TMUX_MAX_CONCURRENCY: usize = 8;
+const DEFAULT_SHOW_MAX_BYTES: u64 = 65_536;
+const DEFAULT_SEARCH_CONTEXT_BYTES: u32 = 40;
+const DEFAULT_SEARCH_MAX_MATCHES: u32 = 50;
+const DEFAULT_SEARCH_MAX_SCAN_BYTES: u64 = 65_536;
+const APPEND_INLINE_MAX_BYTES: u64 = 262_144;
+const PARALLEL_BUFFER_THRESHOLD: usize = 10;
+const FUZZY_MAX_LINE_BYTES: usize = 4_096;
+
+static TMUX_SEMAPHORE: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(TMUX_MAX_CONCURRENCY));
+
+#[derive(Clone)]
+struct BufferText {
+    name: String,
+    text: String,
+}
+
+/// Options for buffer search operations.
+#[derive(Clone, Debug, Default)]
+pub struct SearchOptions {
+    pub context_bytes: Option<u32>,
+    pub max_matches: Option<u32>,
+    pub max_scan_bytes: Option<u64>,
+    pub include_similarity: bool,
+    pub fuzzy_match: bool,
+    pub similarity_threshold: Option<f32>,
+    pub resume_from_offset: Option<BTreeMap<String, u64>>,
+}
+
+/// Options for anchor-scoped subsearch.
+#[derive(Clone, Debug)]
+pub struct SubsearchOptions {
+    pub context_bytes: u32,
+    pub max_matches: Option<u32>,
+    pub include_similarity: bool,
+    pub fuzzy_match: bool,
+    pub similarity_threshold: Option<f32>,
+    pub resume_from_offset: Option<u64>,
+}
+
+struct BufferScanResult {
+    name: String,
+    matches: Vec<BufferSearchMatch>,
+    scan_end: usize,
+    truncated_by_scan: bool,
+    fuzzy_skipped_lines: u32,
+    fuzzy_skipped_bytes: u64,
+}
 
 /// Resolve the tmux socket path from an override or environment variable.
 pub fn resolve_socket(socket: Option<&str>) -> Option<String> {
@@ -45,27 +104,61 @@ fn get_ssh_args() -> Result<Option<Vec<String>>> {
     }
 }
 
-/// Execute a tmux command with the given arguments and return stdout.
-pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Result<String> {
+fn ssh_enabled() -> Result<bool> {
+    Ok(get_ssh_args()?.is_some())
+}
+
+async fn run_tmux_with_socket(
+    args: &[&str],
+    socket: Option<&str>,
+    stdin: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    let _permit = TMUX_SEMAPHORE.acquire().await.map_err(|e| Error::Tmux {
+        message: format!("tmux semaphore closed: {e}"),
+    })?;
+
     let socket_args = get_socket_args(socket);
     let ssh_args = get_ssh_args()?;
 
-    let output = if let Some(mut ssh_args) = ssh_args {
+    let mut command = if let Some(mut ssh_args) = ssh_args {
         ssh_args.push("tmux".to_string());
         ssh_args.extend(socket_args);
         ssh_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        Command::new("ssh")
-            .args(&ssh_args)
-            .output()
-            .await
-            .map_err(|e| Error::Tmux {
-                message: format!("failed to spawn ssh: {e}"),
-            })?
+        let mut cmd = Command::new("ssh");
+        cmd.args(&ssh_args);
+        cmd
     } else {
         let mut tmux_args = socket_args;
         tmux_args.extend(args.iter().map(|arg| (*arg).to_string()));
-        Command::new("tmux")
-            .args(&tmux_args)
+        let mut cmd = Command::new("tmux");
+        cmd.args(&tmux_args);
+        cmd
+    };
+
+    let output = if let Some(input) = stdin {
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::Tmux {
+                message: format!("failed to spawn tmux: {e}"),
+            })?;
+        if let Some(mut child_stdin) = child.stdin.take() {
+            child_stdin
+                .write_all(input)
+                .await
+                .map_err(|e| Error::Tmux {
+                    message: format!("failed to write tmux stdin: {e}"),
+                })?;
+        }
+        child.wait_with_output().await.map_err(|e| Error::Tmux {
+            message: format!("failed to wait for tmux: {e}"),
+        })?
+    } else {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .output()
             .await
             .map_err(|e| Error::Tmux {
@@ -73,13 +166,27 @@ pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Re
             })?
     };
 
+    Ok(output)
+}
+
+async fn execute_tmux_with_socket_bytes(
+    args: &[&str],
+    socket: Option<&str>,
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let output = run_tmux_with_socket(args, socket, stdin).await?;
     if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(stdout)
+        Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(Error::Tmux { message: stderr })
     }
+}
+
+/// Execute a tmux command with the given arguments and return stdout.
+pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Result<String> {
+    let stdout = execute_tmux_with_socket_bytes(args, socket, None).await?;
+    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
 }
 
 /// Execute a tmux command using the default socket (if configured).
@@ -202,12 +309,17 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
 
     output
         .lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(idx, line)| {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 3 {
+                let size_u64: u64 = parts[1].parse().unwrap_or(0);
+                let size = std::cmp::min(size_u64, u32::MAX as u64) as u32;
                 Some(BufferInfo {
                     name: parts[0].to_string(),
-                    size: parts[1].parse().unwrap_or(0),
+                    size,
+                    size_bytes: size_u64,
+                    order_index: idx as u32,
                     created: parts[2].parse().ok(),
                 })
             } else {
@@ -326,7 +438,36 @@ pub async fn show_buffer(name: Option<&str>, socket: Option<&str>) -> Result<Str
         args.push("-b");
         args.push(name);
     }
-    execute_tmux_with_socket(&args, socket).await
+    let stdout = execute_tmux_with_socket_bytes(&args, socket, None).await?;
+    Ok(String::from_utf8_lossy(&stdout).to_string())
+}
+
+/// Show a tmux buffer and return raw bytes.
+pub async fn show_buffer_bytes(name: Option<&str>, socket: Option<&str>) -> Result<Vec<u8>> {
+    let mut args = vec!["show-buffer"];
+    if let Some(name) = name {
+        args.push("-b");
+        args.push(name);
+    }
+    execute_tmux_with_socket_bytes(&args, socket, None).await
+}
+
+/// Show a tmux buffer slice bounded by offset/max bytes (lossy UTF-8).
+pub async fn show_buffer_slice(
+    name: Option<&str>,
+    offset_bytes: Option<u64>,
+    max_bytes: Option<u64>,
+    socket: Option<&str>,
+) -> Result<String> {
+    let bytes = show_buffer_bytes(name, socket).await?;
+    let offset = offset_bytes.unwrap_or(0) as usize;
+    let max = max_bytes.unwrap_or(DEFAULT_SHOW_MAX_BYTES) as usize;
+    if max == 0 || offset >= bytes.len() {
+        return Ok(String::new());
+    }
+    let end = std::cmp::min(bytes.len(), offset.saturating_add(max));
+    let slice = &bytes[offset..end];
+    Ok(String::from_utf8_lossy(slice).to_string())
 }
 
 /// Save a tmux buffer to a file path.
@@ -335,10 +476,831 @@ pub async fn save_buffer(name: &str, path: &str, socket: Option<&str>) -> Result
     Ok(())
 }
 
+/// Load a tmux buffer from a file path.
+pub async fn load_buffer(name: &str, path: &str, socket: Option<&str>) -> Result<()> {
+    execute_tmux_with_socket(&["load-buffer", "-b", name, path], socket).await?;
+    Ok(())
+}
+
 /// Delete a tmux buffer.
 pub async fn delete_buffer(name: &str, socket: Option<&str>) -> Result<()> {
     execute_tmux_with_socket(&["delete-buffer", "-b", name], socket).await?;
     Ok(())
+}
+
+/// Set a tmux buffer from raw bytes, preferring stdin load-buffer.
+pub async fn set_buffer_bytes(name: &str, content: &[u8], socket: Option<&str>) -> Result<()> {
+    let load_args = ["load-buffer", "-b", name, "-"];
+    match execute_tmux_with_socket_bytes(&load_args, socket, Some(content)).await {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let content_str = String::from_utf8_lossy(content);
+            execute_tmux_with_socket(&["set-buffer", "-b", name, "--", &content_str], socket)
+                .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Set a tmux buffer from UTF-8 content.
+pub async fn set_buffer(name: &str, content: &str, socket: Option<&str>) -> Result<()> {
+    set_buffer_bytes(name, content.as_bytes(), socket).await
+}
+
+/// Append content to a tmux buffer.
+pub async fn append_buffer(name: &str, content: &str, socket: Option<&str>) -> Result<()> {
+    let buffers = list_buffers(socket).await?;
+    let existing = buffers.iter().find(|b| b.name == name);
+    if existing.is_none() {
+        return set_buffer(name, content, socket).await;
+    }
+
+    let size_bytes = existing.map(|b| b.size_bytes).unwrap_or(0);
+    let use_tempfile = size_bytes > APPEND_INLINE_MAX_BYTES && !ssh_enabled()?;
+
+    if use_tempfile {
+        let temp = tempfile::NamedTempFile::new().map_err(|e| Error::Tmux {
+            message: format!("failed to create temp file: {e}"),
+        })?;
+        let path = temp.path().to_string_lossy().to_string();
+        save_buffer(name, &path, socket).await?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, content.as_bytes()))
+            .map_err(|e| Error::Tmux {
+                message: format!("failed to append temp buffer: {e}"),
+            })?;
+        execute_tmux_with_socket(&["load-buffer", "-b", name, &path], socket).await?;
+        Ok(())
+    } else {
+        let mut existing_bytes = show_buffer_bytes(Some(name), socket).await?;
+        existing_bytes.extend_from_slice(content.as_bytes());
+        set_buffer_bytes(name, &existing_bytes, socket).await
+    }
+}
+
+/// Rename a tmux buffer by copying and deleting the original.
+pub async fn rename_buffer(from: &str, to: &str, socket: Option<&str>) -> Result<()> {
+    let bytes = show_buffer_bytes(Some(from), socket).await?;
+    set_buffer_bytes(to, &bytes, socket).await?;
+    delete_buffer(from, socket).await?;
+    Ok(())
+}
+
+fn clamp_char_boundary(text: &str, idx: usize, forward: bool) -> usize {
+    if idx >= text.len() {
+        return text.len();
+    }
+    if text.is_char_boundary(idx) {
+        return idx;
+    }
+    let mut i = idx;
+    if forward {
+        while i < text.len() && !text.is_char_boundary(i) {
+            i += 1;
+        }
+    } else {
+        while i > 0 && !text.is_char_boundary(i) {
+            i -= 1;
+        }
+    }
+    i
+}
+
+// rapidfuzz (feature-gated) provides fuzzy similarity scoring when requested.
+#[cfg(feature = "rapidfuzz")]
+fn similarity_score(query: &str, matched: &str) -> f32 {
+    rapidfuzz::fuzz::ratio(query.chars(), matched.chars(), None, None)
+        .unwrap_or(0.0)
+        .clamp(0.0, 1.0) as f32
+}
+
+#[cfg(not(feature = "rapidfuzz"))]
+fn similarity_score(_query: &str, _matched: &str) -> f32 {
+    0.0
+}
+
+fn best_fuzzy_window(query: &str, line: &str) -> (f32, usize, usize) {
+    if line.is_empty() {
+        return (0.0, 0, 0);
+    }
+    let query_chars = query.chars().count();
+    if query_chars == 0 {
+        return (0.0, 0, 0);
+    }
+
+    let line_chars: Vec<usize> = line.char_indices().map(|(i, _)| i).collect();
+    if query_chars >= line_chars.len() {
+        return (similarity_score(query, line), 0, line.len());
+    }
+
+    let mut best_score = 0.0;
+    let mut best_start = 0;
+    let mut best_len = line.len();
+    for i in 0..=line_chars.len().saturating_sub(query_chars) {
+        let start = line_chars[i];
+        let end = if i + query_chars < line_chars.len() {
+            line_chars[i + query_chars]
+        } else {
+            line.len()
+        };
+        let window = &line[start..end];
+        let score = similarity_score(query, window);
+        if score > best_score {
+            best_score = score;
+            best_start = start;
+            best_len = end.saturating_sub(start);
+        }
+    }
+
+    (best_score, best_start, best_len)
+}
+
+struct MatchContext<'a> {
+    buffer: &'a str,
+    text: &'a str,
+    query: &'a str,
+    context_bytes: usize,
+    include_similarity: bool,
+}
+
+struct MatchCollection {
+    matches: Vec<BufferSearchMatch>,
+    fuzzy_skipped_lines: u32,
+    fuzzy_skipped_bytes: u64,
+}
+
+fn build_match(
+    ctx: &MatchContext<'_>,
+    offset: usize,
+    match_len: usize,
+    scan_start: usize,
+    scan_end: usize,
+) -> BufferSearchMatch {
+    let context_start =
+        clamp_char_boundary(ctx.text, offset.saturating_sub(ctx.context_bytes), false);
+    let context_end = clamp_char_boundary(
+        ctx.text,
+        offset
+            .saturating_add(match_len)
+            .saturating_add(ctx.context_bytes),
+        true,
+    );
+    let bounded_start = context_start.max(scan_start);
+    let bounded_end = context_end.min(scan_end);
+    let snippet = if bounded_start < bounded_end {
+        ctx.text[bounded_start..bounded_end].to_string()
+    } else {
+        String::new()
+    };
+    let matched_text = &ctx.text[offset..offset.saturating_add(match_len)];
+    let similarity = if ctx.include_similarity {
+        Some(similarity_score(ctx.query, matched_text))
+    } else {
+        None
+    };
+    BufferSearchMatch {
+        match_id: format!("{}:{offset}", ctx.buffer),
+        buffer: ctx.buffer.to_string(),
+        offset_bytes: offset as u64,
+        match_len: match_len as u32,
+        context_start: bounded_start as u64,
+        context_end: bounded_end as u64,
+        snippet,
+        similarity,
+    }
+}
+
+fn collect_matches(
+    ctx: &MatchContext<'_>,
+    scan_start: usize,
+    scan_end: usize,
+    mode: SearchMode,
+    regex: Option<&Regex>,
+    fuzzy_enabled: bool,
+    similarity_threshold: f32,
+) -> MatchCollection {
+    let scan_text = &ctx.text[scan_start..scan_end];
+    let mut matches: Vec<BufferSearchMatch> = Vec::new();
+    let mut seen_offsets: BTreeSet<u64> = BTreeSet::new();
+    let mut fuzzy_skipped_lines: u32 = 0;
+    let mut fuzzy_skipped_bytes: u64 = 0;
+
+    if mode == SearchMode::Literal {
+        for (offset, _) in scan_text.match_indices(ctx.query) {
+            let absolute = scan_start.saturating_add(offset);
+            matches.push(build_match(
+                ctx,
+                absolute,
+                ctx.query.len(),
+                scan_start,
+                scan_end,
+            ));
+            seen_offsets.insert(absolute as u64);
+        }
+    } else if let Some(regex) = regex {
+        for m in regex.find_iter(scan_text) {
+            let match_len = m.end().saturating_sub(m.start());
+            let absolute = scan_start.saturating_add(m.start());
+            matches.push(build_match(ctx, absolute, match_len, scan_start, scan_end));
+            seen_offsets.insert(absolute as u64);
+        }
+    }
+
+    // Optional fuzzy match path (feature-gated) for typo-tolerant searching.
+    if fuzzy_enabled {
+        let mut offset = 0usize;
+        for line in scan_text.split('\n') {
+            let line_len = line.len();
+            if line_len > 0 {
+                if line_len > FUZZY_MAX_LINE_BYTES {
+                    fuzzy_skipped_lines = fuzzy_skipped_lines.saturating_add(1);
+                    fuzzy_skipped_bytes = fuzzy_skipped_bytes.saturating_add(line_len as u64);
+                } else {
+                    let (score, best_start, best_len) = best_fuzzy_window(ctx.query, line);
+                    if score >= similarity_threshold && best_len > 0 {
+                        let absolute = scan_start.saturating_add(offset).saturating_add(best_start);
+                        let absolute_u64 = absolute as u64;
+                        if !seen_offsets.contains(&absolute_u64) {
+                            let mut entry =
+                                build_match(ctx, absolute, best_len, scan_start, scan_end);
+                            entry.similarity = Some(score);
+                            matches.push(entry);
+                            seen_offsets.insert(absolute_u64);
+                        }
+                    }
+                }
+            }
+            offset = offset.saturating_add(line_len + 1);
+            if offset >= scan_text.len() {
+                break;
+            }
+        }
+    }
+
+    matches.sort_by_key(|m| m.offset_bytes);
+    MatchCollection {
+        matches,
+        fuzzy_skipped_lines,
+        fuzzy_skipped_bytes,
+    }
+}
+
+fn resolve_similarity_flags(
+    include_similarity: bool,
+    fuzzy_match: bool,
+    similarity_threshold: Option<f32>,
+) -> Result<(bool, bool, f32)> {
+    let fuzzy_enabled = fuzzy_match || similarity_threshold.is_some();
+    let include_similarity = include_similarity || fuzzy_enabled;
+
+    if include_similarity && !cfg!(feature = "rapidfuzz") {
+        return Err(Error::InvalidArgument {
+            message: "similarity/fuzzy matching requires the rapidfuzz feature".into(),
+        });
+    }
+
+    let threshold = similarity_threshold.unwrap_or(0.8).clamp(0.0, 1.0);
+    Ok((include_similarity, fuzzy_enabled, threshold))
+}
+
+fn search_texts(
+    buffers: Vec<BufferText>,
+    query: &str,
+    mode: SearchMode,
+    options: SearchOptions,
+) -> Result<BufferSearchOutput> {
+    if query.is_empty() {
+        return Err(Error::InvalidArgument {
+            message: "query must not be empty".into(),
+        });
+    }
+
+    let SearchOptions {
+        context_bytes,
+        max_matches,
+        max_scan_bytes,
+        include_similarity,
+        fuzzy_match,
+        similarity_threshold,
+        resume_from_offset,
+    } = options;
+
+    let context_bytes = context_bytes.unwrap_or(DEFAULT_SEARCH_CONTEXT_BYTES) as usize;
+    let max_matches = max_matches.unwrap_or(DEFAULT_SEARCH_MAX_MATCHES);
+    let max_scan_bytes = max_scan_bytes.unwrap_or(DEFAULT_SEARCH_MAX_SCAN_BYTES) as usize;
+    let (include_similarity, fuzzy_enabled, similarity_threshold) =
+        resolve_similarity_flags(include_similarity, fuzzy_match, similarity_threshold)?;
+
+    let regex = if mode == SearchMode::Regex {
+        Some(Regex::new(query).map_err(|e| Error::InvalidArgument {
+            message: format!("invalid regex: {e}"),
+        })?)
+    } else {
+        None
+    };
+
+    let mut buffer_texts: Vec<(BufferText, usize, usize, bool)> = Vec::new();
+    let mut bytes_scanned_total: u64 = 0;
+
+    if let Some(ref resume) = resume_from_offset {
+        let buffer_names: BTreeSet<&str> = buffers.iter().map(|b| b.name.as_str()).collect();
+        for name in resume.keys() {
+            if !buffer_names.contains(name.as_str()) {
+                return Err(Error::InvalidArgument {
+                    message: format!("resumeFromOffset references unknown buffer '{name}'"),
+                });
+            }
+        }
+    }
+
+    for buffer in buffers.iter() {
+        let scan_start = if let Some(ref resume) = resume_from_offset {
+            if let Some(offset) = resume.get(&buffer.name) {
+                let offset = *offset as usize;
+                if offset > buffer.text.len() {
+                    return Err(Error::InvalidArgument {
+                        message: format!(
+                            "resumeFromOffset {} exceeds buffer '{}' length {}",
+                            offset,
+                            buffer.name,
+                            buffer.text.len()
+                        ),
+                    });
+                }
+                clamp_char_boundary(&buffer.text, offset, false)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let scan_end = clamp_char_boundary(
+            &buffer.text,
+            scan_start
+                .saturating_add(max_scan_bytes)
+                .min(buffer.text.len()),
+            false,
+        );
+        bytes_scanned_total += (scan_end - scan_start) as u64;
+        buffer_texts.push((
+            buffer.clone(),
+            scan_start,
+            scan_end,
+            scan_end < buffer.text.len(),
+        ));
+    }
+
+    let use_parallel = cfg!(feature = "rayon") && buffer_texts.len() >= PARALLEL_BUFFER_THRESHOLD;
+
+    let scan_results: Vec<BufferScanResult> = if use_parallel {
+        #[cfg(feature = "rayon")]
+        {
+            use rayon::prelude::*;
+            buffer_texts
+                .par_iter()
+                .map(|(buffer, scan_start, scan_end, truncated_by_scan)| {
+                    let ctx = MatchContext {
+                        buffer: &buffer.name,
+                        text: &buffer.text,
+                        query,
+                        context_bytes,
+                        include_similarity,
+                    };
+                    let collection = collect_matches(
+                        &ctx,
+                        *scan_start,
+                        *scan_end,
+                        mode,
+                        regex.as_ref(),
+                        fuzzy_enabled,
+                        similarity_threshold,
+                    );
+                    BufferScanResult {
+                        name: buffer.name.clone(),
+                        matches: collection.matches,
+                        scan_end: *scan_end,
+                        truncated_by_scan: *truncated_by_scan,
+                        fuzzy_skipped_lines: collection.fuzzy_skipped_lines,
+                        fuzzy_skipped_bytes: collection.fuzzy_skipped_bytes,
+                    }
+                })
+                .collect()
+        }
+        #[cfg(not(feature = "rayon"))]
+        {
+            Vec::new()
+        }
+    } else {
+        buffer_texts
+            .iter()
+            .map(|(buffer, scan_start, scan_end, truncated_by_scan)| {
+                let ctx = MatchContext {
+                    buffer: &buffer.name,
+                    text: &buffer.text,
+                    query,
+                    context_bytes,
+                    include_similarity,
+                };
+                let collection = collect_matches(
+                    &ctx,
+                    *scan_start,
+                    *scan_end,
+                    mode,
+                    regex.as_ref(),
+                    fuzzy_enabled,
+                    similarity_threshold,
+                );
+                BufferScanResult {
+                    name: buffer.name.clone(),
+                    matches: collection.matches,
+                    scan_end: *scan_end,
+                    truncated_by_scan: *truncated_by_scan,
+                    fuzzy_skipped_lines: collection.fuzzy_skipped_lines,
+                    fuzzy_skipped_bytes: collection.fuzzy_skipped_bytes,
+                }
+            })
+            .collect()
+    };
+
+    let mut output_matches: Vec<BufferSearchMatch> = Vec::new();
+    let mut truncated_buffers: Vec<String> = Vec::new();
+    let mut resume_from_offset: BTreeMap<String, u64> = BTreeMap::new();
+    let mut remaining = max_matches as i64;
+    let mut similarity_sum: f32 = 0.0;
+    let mut similarity_max: f32 = 0.0;
+    let mut similarity_count: u32 = 0;
+    let mut fuzzy_skipped_lines: u32 = 0;
+    let mut fuzzy_skipped_bytes: u64 = 0;
+
+    for result in scan_results {
+        fuzzy_skipped_lines = fuzzy_skipped_lines.saturating_add(result.fuzzy_skipped_lines);
+        fuzzy_skipped_bytes = fuzzy_skipped_bytes.saturating_add(result.fuzzy_skipped_bytes);
+        let mut added_in_buffer: usize = 0;
+        if remaining > 0 {
+            for m in &result.matches {
+                if remaining == 0 {
+                    break;
+                }
+                output_matches.push(m.clone());
+                added_in_buffer += 1;
+                remaining -= 1;
+                if include_similarity {
+                    if let Some(score) = m.similarity {
+                        similarity_sum += score;
+                        similarity_max = similarity_max.max(score);
+                        similarity_count += 1;
+                    }
+                }
+            }
+            if remaining == 0 && result.matches.len() > added_in_buffer {
+                let next_match = &result.matches[added_in_buffer];
+                resume_from_offset
+                    .entry(result.name.clone())
+                    .or_insert(next_match.offset_bytes);
+                if !truncated_buffers.contains(&result.name) {
+                    truncated_buffers.push(result.name.clone());
+                }
+            }
+        } else if let Some(first) = result.matches.first() {
+            resume_from_offset
+                .entry(result.name.clone())
+                .or_insert(first.offset_bytes);
+            if !truncated_buffers.contains(&result.name) {
+                truncated_buffers.push(result.name.clone());
+            }
+        }
+
+        if result.truncated_by_scan {
+            resume_from_offset
+                .entry(result.name.clone())
+                .or_insert(result.scan_end as u64);
+            if !truncated_buffers.contains(&result.name) {
+                truncated_buffers.push(result.name.clone());
+            }
+        }
+    }
+
+    let total_matches = output_matches.len() as u32;
+    let avg_similarity = if include_similarity && similarity_count > 0 {
+        Some(similarity_sum / similarity_count as f32)
+    } else {
+        None
+    };
+    let max_similarity = if include_similarity && similarity_count > 0 {
+        Some(similarity_max)
+    } else {
+        None
+    };
+
+    Ok(BufferSearchOutput {
+        query: query.to_string(),
+        mode,
+        context_bytes: context_bytes as u32,
+        max_matches,
+        include_similarity,
+        fuzzy_match: fuzzy_enabled,
+        similarity_threshold: if fuzzy_enabled {
+            Some(similarity_threshold)
+        } else {
+            None
+        },
+        buffers: buffers.iter().map(|b| b.name.clone()).collect(),
+        total_matches,
+        buffers_scanned: buffers.len() as u32,
+        bytes_scanned_total,
+        truncated_buffers,
+        resume_from_offset,
+        matches: output_matches,
+        max_similarity,
+        avg_similarity,
+        fuzzy_skipped_lines,
+        fuzzy_skipped_bytes,
+    })
+}
+
+/// Pure search over a single UTF-8 buffer (no tmux interaction).
+pub fn search_text(
+    buffer_name: &str,
+    text: &str,
+    query: &str,
+    mode: SearchMode,
+    options: SearchOptions,
+) -> Result<BufferSearchOutput> {
+    search_texts(
+        vec![BufferText {
+            name: buffer_name.to_string(),
+            text: text.to_string(),
+        }],
+        query,
+        mode,
+        options,
+    )
+}
+
+/// Pure anchor-scoped subsearch over a single UTF-8 buffer (no tmux interaction).
+pub fn subsearch_text(
+    buffer: &str,
+    text: &str,
+    anchor_offset: u64,
+    anchor_len: u32,
+    query: &str,
+    mode: SearchMode,
+    options: SubsearchOptions,
+) -> Result<BufferSearchOutput> {
+    if query.is_empty() {
+        return Err(Error::InvalidArgument {
+            message: "query must not be empty".into(),
+        });
+    }
+
+    let (include_similarity, fuzzy_enabled, similarity_threshold) = resolve_similarity_flags(
+        options.include_similarity,
+        options.fuzzy_match,
+        options.similarity_threshold,
+    )?;
+
+    let anchor_offset = anchor_offset as usize;
+    if anchor_offset > text.len() {
+        return Err(Error::InvalidArgument {
+            message: format!(
+                "anchor offset {anchor_offset} exceeds buffer length {}",
+                text.len()
+            ),
+        });
+    }
+
+    let context = options.context_bytes as usize;
+    let anchor_len = anchor_len as usize;
+    let start = anchor_offset.saturating_sub(context);
+    let end = anchor_offset
+        .saturating_add(anchor_len)
+        .saturating_add(context)
+        .min(text.len());
+
+    let mut scan_start = clamp_char_boundary(text, start, false);
+    let scan_end = clamp_char_boundary(text, end, true);
+    let max_matches = options.max_matches.unwrap_or(DEFAULT_SEARCH_MAX_MATCHES);
+    if let Some(resume_offset) = options.resume_from_offset {
+        let resume_offset = resume_offset as usize;
+        if resume_offset > text.len() {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "resumeFromOffset {} exceeds buffer length {}",
+                    resume_offset,
+                    text.len()
+                ),
+            });
+        }
+        if resume_offset < scan_start || resume_offset > scan_end {
+            return Err(Error::InvalidArgument {
+                message: format!(
+                    "resumeFromOffset {} is outside the anchor window",
+                    resume_offset
+                ),
+            });
+        }
+        scan_start = clamp_char_boundary(text, resume_offset, false);
+    }
+
+    let regex = if mode == SearchMode::Regex {
+        Some(Regex::new(query).map_err(|e| Error::InvalidArgument {
+            message: format!("invalid regex: {e}"),
+        })?)
+    } else {
+        None
+    };
+
+    let ctx = MatchContext {
+        buffer,
+        text,
+        query,
+        context_bytes: context,
+        include_similarity,
+    };
+    let collection = collect_matches(
+        &ctx,
+        scan_start,
+        scan_end,
+        mode,
+        regex.as_ref(),
+        fuzzy_enabled,
+        similarity_threshold,
+    );
+    let all_matches = collection.matches;
+
+    let mut output_matches: Vec<BufferSearchMatch> = Vec::new();
+    let mut truncated_buffers: Vec<String> = Vec::new();
+    let mut resume_from_offset: BTreeMap<String, u64> = BTreeMap::new();
+    let mut remaining = max_matches as i64;
+    let mut similarity_sum: f32 = 0.0;
+    let mut similarity_max: f32 = 0.0;
+    let mut similarity_count: u32 = 0;
+    let fuzzy_skipped_lines = collection.fuzzy_skipped_lines;
+    let fuzzy_skipped_bytes = collection.fuzzy_skipped_bytes;
+
+    let mut added = 0usize;
+    for m in &all_matches {
+        if remaining == 0 {
+            break;
+        }
+        output_matches.push(m.clone());
+        added += 1;
+        remaining -= 1;
+        if include_similarity {
+            if let Some(score) = m.similarity {
+                similarity_sum += score;
+                similarity_max = similarity_max.max(score);
+                similarity_count += 1;
+            }
+        }
+    }
+
+    if remaining == 0 && all_matches.len() > added {
+        let next_match = &all_matches[added];
+        resume_from_offset.insert(buffer.to_string(), next_match.offset_bytes);
+        truncated_buffers.push(buffer.to_string());
+    }
+
+    if scan_end < text.len() {
+        resume_from_offset
+            .entry(buffer.to_string())
+            .or_insert(scan_end as u64);
+        if !truncated_buffers.contains(&buffer.to_string()) {
+            truncated_buffers.push(buffer.to_string());
+        }
+    }
+
+    let total_matches = output_matches.len() as u32;
+    let avg_similarity = if include_similarity && similarity_count > 0 {
+        Some(similarity_sum / similarity_count as f32)
+    } else {
+        None
+    };
+    let max_similarity = if include_similarity && similarity_count > 0 {
+        Some(similarity_max)
+    } else {
+        None
+    };
+
+    Ok(BufferSearchOutput {
+        query: query.to_string(),
+        mode,
+        context_bytes: options.context_bytes,
+        max_matches,
+        include_similarity,
+        fuzzy_match: fuzzy_enabled,
+        similarity_threshold: if fuzzy_enabled {
+            Some(similarity_threshold)
+        } else {
+            None
+        },
+        buffers: vec![buffer.to_string()],
+        total_matches,
+        buffers_scanned: 1,
+        bytes_scanned_total: (scan_end - scan_start) as u64,
+        truncated_buffers,
+        resume_from_offset,
+        matches: output_matches,
+        max_similarity,
+        avg_similarity,
+        fuzzy_skipped_lines,
+        fuzzy_skipped_bytes,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn search_buffers(
+    names: Option<Vec<String>>,
+    query: &str,
+    mode: SearchMode,
+    context_bytes: Option<u32>,
+    max_matches: Option<u32>,
+    max_scan_bytes: Option<u64>,
+    include_similarity: bool,
+    fuzzy_match: bool,
+    similarity_threshold: Option<f32>,
+    resume_from_offset: Option<BTreeMap<String, u64>>,
+    socket: Option<&str>,
+) -> Result<BufferSearchOutput> {
+    let buffers = if let Some(names) = names {
+        if names.is_empty() {
+            Vec::new()
+        } else {
+            names
+        }
+    } else {
+        list_buffers(socket)
+            .await?
+            .into_iter()
+            .map(|b| b.name)
+            .collect()
+    };
+
+    let mut buffer_texts: Vec<BufferText> = Vec::new();
+    for buffer in &buffers {
+        let bytes = show_buffer_bytes(Some(buffer.as_str()), socket).await?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| Error::InvalidArgument {
+            message: format!("buffer '{buffer}' contains non-UTF-8 bytes; search requires UTF-8"),
+        })?;
+        buffer_texts.push(BufferText {
+            name: buffer.clone(),
+            text: text.to_string(),
+        });
+    }
+
+    let options = SearchOptions {
+        context_bytes,
+        max_matches,
+        max_scan_bytes,
+        include_similarity,
+        fuzzy_match,
+        similarity_threshold,
+        resume_from_offset,
+    };
+
+    search_texts(buffer_texts, query, mode, options)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn subsearch_buffer(
+    buffer: &str,
+    anchor_offset: u64,
+    anchor_len: u32,
+    context_bytes: u32,
+    resume_from_offset: Option<u64>,
+    query: &str,
+    mode: SearchMode,
+    max_matches: Option<u32>,
+    include_similarity: bool,
+    fuzzy_match: bool,
+    similarity_threshold: Option<f32>,
+    socket: Option<&str>,
+) -> Result<BufferSearchOutput> {
+    let bytes = show_buffer_bytes(Some(buffer), socket).await?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| Error::InvalidArgument {
+        message: format!("buffer '{buffer}' contains non-UTF-8 bytes; search requires UTF-8"),
+    })?;
+
+    let options = SubsearchOptions {
+        context_bytes,
+        max_matches,
+        include_similarity,
+        fuzzy_match,
+        similarity_threshold,
+        resume_from_offset,
+    };
+
+    subsearch_text(
+        buffer,
+        text,
+        anchor_offset,
+        anchor_len,
+        query,
+        mode,
+        options,
+    )
 }
 
 /// Get detailed info about a pane.
@@ -814,6 +1776,20 @@ mod tests {
     }
 
     #[rstest]
+    #[case(
+        "buffer0\t10\t1700000000\nbuffer1\t5\t1700000100",
+        vec![
+            BufferInfo { name: "buffer0".into(), size: 10, size_bytes: 10, order_index: 0, created: Some(1700000000) },
+            BufferInfo { name: "buffer1".into(), size: 5, size_bytes: 5, order_index: 1, created: Some(1700000100) },
+        ]
+    )]
+    #[case("", vec![])]
+    fn test_parse_buffers(#[case] input: &str, #[case] expected: Vec<BufferInfo>) {
+        let result = parse_buffers(input);
+        assert_eq!(result, expected);
+    }
+
+    #[rstest]
     #[case("$0\tmy:session:with:colons\t1\t2", vec![
         Session { id: "$0".into(), name: "my:session:with:colons".into(), attached: true, windows: 2 },
     ])]
@@ -1088,6 +2064,33 @@ mod tests {
             }
             _ => panic!("expected invalid argument error"),
         }
+    }
+
+    #[tokio::test]
+    async fn search_buffers_returns_offsets_and_snippets() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_SHOW_BUFFER", "alpha beta gamma beta");
+
+        let result = search_buffers(
+            Some(vec!["buffer0".to_string()]),
+            "beta",
+            SearchMode::Literal,
+            Some(2),
+            Some(10),
+            Some(1024),
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("search buffers");
+
+        assert_eq!(result.total_matches, 2);
+        assert_eq!(result.matches.len(), 2);
+        assert_eq!(result.matches[0].offset_bytes, 6);
+        assert!(result.matches[0].snippet.contains("beta"));
     }
 
     #[test]

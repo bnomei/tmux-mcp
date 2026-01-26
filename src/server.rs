@@ -2,6 +2,7 @@
 //!
 //! This module registers all tools and resources using the rmcp crate.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,7 +22,9 @@ use rmcp::ErrorData as McpError;
 use crate::commands::CommandTracker;
 use crate::security::SecurityPolicy;
 use crate::tmux;
-use crate::types::{BufferInfo, ClientInfo, CommandStatus, Pane, Session, Window};
+use crate::types::{
+    BufferInfo, BufferSearchOutput, ClientInfo, CommandStatus, Pane, SearchMode, Session, Window,
+};
 
 /// The main MCP server for tmux operations.
 #[derive(Clone)]
@@ -384,6 +387,12 @@ pub struct DetachClientInput {
 pub struct ShowBufferInput {
     /// Buffer name (omit to show the most recent buffer)
     pub name: Option<String>,
+    /// Optional offset into the buffer in bytes
+    #[serde(rename = "offsetBytes")]
+    pub offset_bytes: Option<u64>,
+    /// Optional maximum number of bytes to return
+    #[serde(rename = "maxBytes")]
+    pub max_bytes: Option<u64>,
     /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
     pub socket: Option<String>,
 }
@@ -399,11 +408,138 @@ pub struct SaveBufferInput {
     pub socket: Option<String>,
 }
 
+/// Input parameters for the load-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct LoadBufferInput {
+    /// Buffer name
+    pub name: String,
+    /// Path to load the buffer contents from
+    pub path: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
 /// Input parameters for the delete-buffer tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DeleteBufferInput {
     /// Buffer name
     pub name: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Input parameters for the set-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SetBufferInput {
+    /// Buffer name
+    pub name: String,
+    /// Buffer content (UTF-8)
+    pub content: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Input parameters for the append-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppendBufferInput {
+    /// Buffer name
+    pub name: String,
+    /// Content to append (UTF-8)
+    pub content: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Input parameters for the rename-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RenameBufferInput {
+    /// Source buffer name
+    pub from: String,
+    /// Destination buffer name
+    pub to: String,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Search anchor for subsearch-buffer.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchAnchorInput {
+    /// Match offset in bytes (UTF-8)
+    #[serde(rename = "offsetBytes", alias = "offset_bytes")]
+    pub offset_bytes: u64,
+    /// Match length in bytes (UTF-8)
+    #[serde(rename = "matchLen", alias = "match_len")]
+    pub match_len: u32,
+    /// Optional buffer name (used if top-level buffer is omitted)
+    pub buffer: Option<String>,
+}
+
+/// Input parameters for the search-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SearchBufferInput {
+    /// Optional single buffer name (alias for buffers)
+    #[serde(rename = "buffer")]
+    pub buffer: Option<String>,
+    /// Optional list of buffer names to search (defaults to all buffers)
+    pub buffers: Option<Vec<String>>,
+    /// Query string
+    pub query: String,
+    /// Search mode: literal or regex
+    pub mode: SearchMode,
+    /// Context window size in bytes
+    #[serde(rename = "contextBytes")]
+    pub context_bytes: Option<u32>,
+    /// Max matches to return
+    #[serde(rename = "maxMatches")]
+    pub max_matches: Option<u32>,
+    /// Max bytes to scan per buffer
+    #[serde(rename = "maxScanBytes")]
+    pub max_scan_bytes: Option<u64>,
+    /// Whether to include similarity scores
+    #[serde(rename = "includeSimilarity")]
+    pub include_similarity: Option<bool>,
+    /// Enable fuzzy matching
+    #[serde(rename = "fuzzyMatch")]
+    pub fuzzy_match: Option<bool>,
+    /// Similarity threshold for fuzzy matching (0.0-1.0)
+    #[serde(rename = "similarityThreshold")]
+    pub similarity_threshold: Option<f32>,
+    /// Optional per-buffer resume offset in bytes (UTF-8)
+    #[serde(rename = "resumeFromOffset")]
+    pub resume_from_offset: Option<BTreeMap<String, u64>>,
+    /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
+    pub socket: Option<String>,
+}
+
+/// Input parameters for the subsearch-buffer tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SubsearchBufferInput {
+    /// Buffer name
+    pub buffer: Option<String>,
+    /// Anchor offset and length from a prior match
+    pub anchor: SearchAnchorInput,
+    /// Context window size in bytes
+    #[serde(rename = "contextBytes", alias = "context_bytes")]
+    pub context_bytes: u32,
+    /// Optional resume offset in bytes (UTF-8) within the anchor window
+    #[serde(rename = "resumeFromOffset")]
+    pub resume_from_offset: Option<u64>,
+    /// Query string
+    pub query: String,
+    /// Search mode: literal or regex
+    pub mode: SearchMode,
+    /// Max matches to return
+    #[serde(rename = "maxMatches")]
+    pub max_matches: Option<u32>,
+    /// Whether to include similarity scores
+    #[serde(rename = "includeSimilarity")]
+    pub include_similarity: Option<bool>,
+    /// Enable fuzzy matching
+    #[serde(rename = "fuzzyMatch")]
+    pub fuzzy_match: Option<bool>,
+    /// Similarity threshold for fuzzy matching (0.0-1.0)
+    #[serde(rename = "similarityThreshold")]
+    pub similarity_threshold: Option<f32>,
     /// Optional tmux socket path override for this call. Prefer a per-agent isolated socket (unique id, e.g. harness session id).
     pub socket: Option<String>,
 }
@@ -688,7 +824,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "show-buffer",
-        description = "Show contents of a tmux paste buffer. If name is omitted, shows the most recent buffer. Use to retrieve copy-mode selections or captured text without rerunning commands.",
+        description = "Show contents of a tmux paste buffer. If name is omitted, shows the most recent buffer. Supports offset/max byte bounds and returns plain text (lossy if needed).",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
     async fn show_buffer(
@@ -702,7 +838,14 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        match tmux::show_buffer(input.0.name.as_deref(), socket.as_deref()).await {
+        match tmux::show_buffer_slice(
+            input.0.name.as_deref(),
+            input.0.offset_bytes,
+            input.0.max_bytes,
+            socket.as_deref(),
+        )
+        .await
+        {
             Ok(content) => Ok(CallToolResult::success(vec![Content::text(content)])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error showing buffer: {e}"
@@ -738,6 +881,33 @@ impl TmuxMcpServer {
     }
 
     #[tool(
+        name = "load-buffer",
+        description = "Load a tmux paste buffer from a file. Use to import local files into tmux buffers for later search or inspection.",
+        annotations(open_world_hint = true)
+    )]
+    async fn load_buffer(
+        &self,
+        input: Parameters<LoadBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("load-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::load_buffer(&input.0.name, &input.0.path, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Buffer {} loaded from {}",
+                input.0.name, input.0.path
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error loading buffer: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
         name = "delete-buffer",
         description = "Delete a tmux paste buffer by name. Use to clean up sensitive data or reduce clutter after exporting.",
         annotations(destructive_hint = true)
@@ -760,6 +930,186 @@ impl TmuxMcpServer {
             ))])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error deleting buffer: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "set-buffer",
+        description = "Create or replace a tmux paste buffer with UTF-8 content.",
+        annotations(destructive_hint = true)
+    )]
+    async fn set_buffer(
+        &self,
+        input: Parameters<SetBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("set-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::set_buffer(&input.0.name, &input.0.content, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Buffer {} set",
+                input.0.name
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error setting buffer: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "append-buffer",
+        description = "Append UTF-8 content to an existing tmux paste buffer.",
+        annotations(destructive_hint = true)
+    )]
+    async fn append_buffer(
+        &self,
+        input: Parameters<AppendBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("append-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::append_buffer(&input.0.name, &input.0.content, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Buffer {} appended",
+                input.0.name
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error appending buffer: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "rename-buffer",
+        description = "Rename a tmux buffer by copying to a new name and deleting the old buffer.",
+        annotations(destructive_hint = true)
+    )]
+    async fn rename_buffer(
+        &self,
+        input: Parameters<RenameBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("rename-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        match tmux::rename_buffer(&input.0.from, &input.0.to, socket.as_deref()).await {
+            Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
+                "Buffer {} renamed to {}",
+                input.0.from, input.0.to
+            ))])),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error renaming buffer: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "search-buffer",
+        description = "Search UTF-8 buffers for a query (literal/regex, optional fuzzy) with structured match metadata; offsets are byte-based; use resumeFromOffset when truncatedBuffers is returned; fuzzy matching skips very long lines.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<BufferSearchOutput>()
+    )]
+    async fn search_buffer(
+        &self,
+        input: Parameters<SearchBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("search-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let include_similarity = input.0.include_similarity.unwrap_or(false);
+        let fuzzy_match = input.0.fuzzy_match.unwrap_or(false);
+        let buffers = if let Some(buffer) = input.0.buffer.as_deref() {
+            Some(vec![buffer.to_string()])
+        } else {
+            input.0.buffers.clone()
+        };
+        match tmux::search_buffers(
+            buffers,
+            &input.0.query,
+            input.0.mode,
+            input.0.context_bytes,
+            input.0.max_matches,
+            input.0.max_scan_bytes,
+            include_similarity,
+            fuzzy_match,
+            input.0.similarity_threshold,
+            input.0.resume_from_offset,
+            socket.as_deref(),
+        )
+        .await
+        {
+            Ok(output) => Ok(structured_output(&output)),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error searching buffers: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "subsearch-buffer",
+        description = "Anchor-scoped follow-up search within a UTF-8 buffer (literal/regex, optional fuzzy); offsets are absolute; resumeFromOffset is relative to the anchor window; fuzzy matching skips very long lines.",
+        annotations(read_only_hint = true, idempotent_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<BufferSearchOutput>()
+    )]
+    async fn subsearch_buffer(
+        &self,
+        input: Parameters<SubsearchBufferInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("subsearch-buffer") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let include_similarity = input.0.include_similarity.unwrap_or(false);
+        let fuzzy_match = input.0.fuzzy_match.unwrap_or(false);
+        let buffer = input
+            .0
+            .buffer
+            .as_deref()
+            .or(input.0.anchor.buffer.as_deref());
+        let Some(buffer) = buffer else {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "Missing buffer name. Provide top-level 'buffer' or anchor.buffer.".to_string(),
+            )]));
+        };
+
+        match tmux::subsearch_buffer(
+            buffer,
+            input.0.anchor.offset_bytes,
+            input.0.anchor.match_len,
+            input.0.context_bytes,
+            input.0.resume_from_offset,
+            &input.0.query,
+            input.0.mode,
+            input.0.max_matches,
+            include_similarity,
+            fuzzy_match,
+            input.0.similarity_threshold,
+            socket.as_deref(),
+        )
+        .await
+        {
+            Ok(output) => Ok(structured_output(&output)),
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error subsearching buffer: {e}"
             ))])),
         }
     }
@@ -2611,6 +2961,8 @@ mod tests {
         let result = server
             .show_buffer(Parameters(ShowBufferInput {
                 name: None,
+                offset_bytes: None,
+                max_bytes: None,
                 socket: None,
             }))
             .await
@@ -2624,6 +2976,17 @@ mod tests {
     async fn save_delete_and_detach_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
+
+        let result = server
+            .load_buffer(Parameters(LoadBufferInput {
+                name: "buffer0".into(),
+                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                socket: None,
+            }))
+            .await
+            .expect("load buffer");
+        assert_eq!(result.is_error, Some(false));
+        assert!(first_text(&result).contains("loaded"));
 
         let result = server
             .save_buffer(Parameters(SaveBufferInput {
@@ -2655,6 +3018,34 @@ mod tests {
             .expect("detach client");
         assert_eq!(result.is_error, Some(false));
         assert!(first_text(&result).contains("detached"));
+    }
+
+    #[test]
+    fn subsearch_input_accepts_snake_case_and_anchor_buffer() {
+        let json = r#"{
+            "anchor": {"buffer": "buf0", "offset_bytes": 12, "match_len": 8},
+            "context_bytes": 200,
+            "query": "baseball",
+            "mode": "literal"
+        }"#;
+        let input: SubsearchBufferInput = serde_json::from_str(json).expect("parse input");
+        assert_eq!(input.buffer, None);
+        assert_eq!(input.anchor.buffer.as_deref(), Some("buf0"));
+        assert_eq!(input.anchor.offset_bytes, 12);
+        assert_eq!(input.anchor.match_len, 8);
+        assert_eq!(input.context_bytes, 200);
+    }
+
+    #[test]
+    fn search_input_accepts_single_buffer_alias() {
+        let json = r#"{
+            "buffer": "oldman",
+            "query": "the boy",
+            "mode": "literal"
+        }"#;
+        let input: SearchBufferInput = serde_json::from_str(json).expect("parse input");
+        assert_eq!(input.buffer.as_deref(), Some("oldman"));
+        assert!(input.buffers.is_none());
     }
 
     #[tokio::test]

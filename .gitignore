@@ -3,7 +3,9 @@ build/
 dist/
 .DS_Store
 *.log
-
+.idea
+.vscode
+tests/fixtures/old-man-and-the-sea.txt
 
 # Added by cargo
 /target
