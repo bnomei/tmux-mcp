@@ -18,6 +18,16 @@ Requires tmux installed and available on `PATH`.
 > [!WARNING]
 > Using this MCP allows the agent to escape the sandbox and its security limitations. Here be dragons!
 
+## Why MCP (Not Just A Skill)
+
+You can automate tmux with a plain-text skill, but the MCP tools are more reliable and cheaper to run:
+
+- Structured inputs and structured outputs reduce ambiguity, which improves agent quality.
+- Tool responses return stable IDs (session/window/pane/command), which avoids fragile name matching.
+- `execute-command` + `get-command-result` yields attributable output and exit codes without screen scraping.
+- Structured results are compact, so the agent spends fewer tokens than repeatedly capturing and parsing panes.
+- The MCP server can enforce policy (tool gating, allow/deny patterns, scoped sockets/sessions/panes).
+
 ## Installation
 
 ### Cargo (crates.io)
@@ -206,6 +216,7 @@ patterns = []
 - **send-home** - Send Home key
 - **send-end** - Send End key
 
+
 ## Resources
 
 The server exposes the following MCP resources:
@@ -224,7 +235,12 @@ The server exposes the following MCP resources:
 
 Resources are dynamically enumerated - the server lists available panes, windows, sessions, clients, and active commands.
 
-## SKILL: Probing and Refining with tmux-buffer-explorer
+## Skills
+
+- [tmux-via-mcp](skills/tmux-via-mcp/SKILL.md) - Use the tmux MCP tools to create sessions, shape layouts, run tracked commands, and automate interactive terminals when a real TTY or parallel panes are required.
+- [tmux-buffer-explorer](skills/tmux-buffer-explorer/SKILL.md) - Explore large tmux buffers via search and bounded slices. Use when buffer data is too large to load at once or needs incremental inspection.
+
+### Probing and Refining with tmux-buffer-explorer
 
 The additonal buffer tools extend tmux’s native buffers for the probe‑and‑refine workflow described in the paper from Alex L. Zhang, Tim Kraska and Omar Khattab [Recursive Language Models](https://arxiv.org/pdf/2512.24601), while keeping all state inside tmux buffers and thus in RAM. They’re general-purpose building blocks used by the coordinating Skill at [skills/tmux-buffer-explorer/SKILL.md](https://github.com/bnomei/tmux-mcp/blob/main/skills/tmux-buffer-explorer/SKILL.md).
 
