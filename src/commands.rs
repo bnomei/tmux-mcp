@@ -4,6 +4,8 @@
 //! in tmux panes, using special markers to track command start/completion and exit codes.
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,6 +23,32 @@ pub const START_MARKER_PREFIX: &str = "TMUX_MCP_START_";
 
 /// Prefix for the end marker, followed by command id and exit code.
 pub const END_MARKER_PREFIX: &str = "TMUX_MCP_DONE_";
+
+#[cfg(test)]
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<OsString>,
+}
+
+#[cfg(test)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.prev.take() {
+            std::env::set_var(self.key, prev);
+        } else {
+            std::env::remove_var(self.key);
+        }
+    }
+}
 
 /// Tracking configuration for command capture retries.
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +148,7 @@ impl CommandTracker {
             started_at: Instant::now(),
             completed_at: None,
             raw_mode,
+            tracking_disabled,
         };
 
         {
@@ -143,9 +172,6 @@ impl CommandTracker {
                 tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await?;
             }
         }
-
-        #[cfg(test)]
-        std::env::set_var("TMUX_MCP_TEST_COMMAND_ID", &command_id);
 
         Ok(command_id)
     }
@@ -173,11 +199,14 @@ impl CommandTracker {
             CommandStatus::Completed | CommandStatus::Error => {
                 return Ok(Some(execution));
             }
-            CommandStatus::Pending if execution.raw_mode => {
+            CommandStatus::Pending if execution.raw_mode || execution.tracking_disabled => {
                 return Ok(Some(execution));
             }
             _ => {}
         }
+
+        #[cfg(test)]
+        let _env_guard = EnvVarGuard::set("TMUX_MCP_TEST_COMMAND_ID", &execution.id);
 
         let mut capture_lines = self.tracking.capture_initial_lines.max(1);
         let max_lines = self.tracking.capture_max_lines.max(capture_lines);
@@ -460,6 +489,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: Some(Instant::now()),
             raw_mode: false,
+            tracking_disabled: false,
         };
 
         {
@@ -504,6 +534,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: None,
             raw_mode: false,
+            tracking_disabled: false,
         };
 
         {
@@ -554,6 +585,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: None,
             raw_mode: false,
+            tracking_disabled: false,
         };
 
         {
@@ -598,6 +630,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: None,
             raw_mode: false,
+            tracking_disabled: false,
         };
 
         {
@@ -632,6 +665,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: Some(Instant::now() - Duration::from_secs(120)),
             raw_mode: false,
+            tracking_disabled: false,
         };
         let new_exec = CommandExecution {
             id: new_id.clone(),
@@ -644,6 +678,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: Some(Instant::now()),
             raw_mode: false,
+            tracking_disabled: false,
         };
         let pending_exec = CommandExecution {
             id: pending_id.clone(),
@@ -656,6 +691,7 @@ mod tests {
             started_at: Instant::now(),
             completed_at: None,
             raw_mode: false,
+            tracking_disabled: false,
         };
 
         {
