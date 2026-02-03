@@ -4953,8 +4953,7 @@ mod tests {
     async fn read_resource_command_denied_by_socket_policy() {
         let mut stub = TmuxStub::new();
         stub.set_var("TMUX_MCP_SOCKET", "/tmp/recorded.sock");
-        let server =
-            server_with_policy("[security]\nallowed_sockets = [\"/tmp/allowed.sock\"]\n");
+        let server = server_with_policy("[security]\nallowed_sockets = [\"/tmp/allowed.sock\"]\n");
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let command_id = server
