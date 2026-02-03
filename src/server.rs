@@ -1351,20 +1351,35 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_tool("get-command-result") {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
-        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        let requested_override = input.0.socket.as_deref().filter(|s| !s.is_empty());
+        let socket = tmux::resolve_socket(requested_override);
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Some(cmd) = self.tracker.get_command(&input.0.command_id).await {
-            if let Some(requested) = socket.as_deref() {
-                if let Some(recorded) = cmd.socket.as_deref() {
-                    if recorded != requested {
+            let recorded = cmd.socket.as_deref();
+            match (requested_override, recorded) {
+                (Some(requested), Some(recorded)) if requested != recorded => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Socket override does not match recorded socket for command {}",
+                        input.0.command_id
+                    ))]));
+                }
+                (Some(_), None) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Socket override is not allowed for command {}",
+                        input.0.command_id
+                    ))]));
+                }
+                (None, Some(recorded)) => {
+                    if socket.as_deref() != Some(recorded) {
                         return Ok(CallToolResult::error(vec![Content::text(format!(
-                            "Socket override does not match recorded socket for command {}",
+                            "Socket does not match recorded socket for command {}",
                             input.0.command_id
                         ))]));
                     }
                 }
+                _ => {}
             }
             if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
                 return Ok(CallToolResult::error(vec![Content::text(format!(
@@ -2777,6 +2792,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     });
                 }
                 if let Some(cmd) = self.tracker.get_command(command_id).await {
+                    if let Err(e) = self.policy.check_socket(cmd.socket.as_deref()) {
+                        return Ok(rmcp::model::ReadResourceResult {
+                            contents: vec![ResourceContents::text(
+                                format!("Access denied: {e}"),
+                                uri,
+                            )],
+                        });
+                    }
                     if let Err(e) = self.policy.check_pane(&cmd.pane_id) {
                         return Ok(rmcp::model::ReadResourceResult {
                             contents: vec![ResourceContents::text(
@@ -3882,6 +3905,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_command_result_rejects_socket_override_when_recorded_none() {
+        let mut stub = TmuxStub::new();
+        stub.remove_var("TMUX_MCP_SOCKET");
+        let server = server_default();
+
+        let result = server
+            .execute_command(Parameters(ExecuteCommandInput {
+                pane_id: "%1".into(),
+                command: "echo hi".into(),
+                raw_mode: None,
+                no_enter: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap();
+
+        let result = server
+            .get_command_result(Parameters(GetCommandResultInput {
+                command_id: command_id.to_string(),
+                socket: Some("/tmp/override.sock".into()),
+            }))
+            .await
+            .expect("get command result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("Socket override is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn get_command_result_rejects_mismatched_socket_override() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SOCKET", "/tmp/recorded.sock");
+        let server = server_default();
+
+        let result = server
+            .execute_command(Parameters(ExecuteCommandInput {
+                pane_id: "%1".into(),
+                command: "echo hi".into(),
+                raw_mode: None,
+                no_enter: None,
+                delay_ms: None,
+                socket: None,
+            }))
+            .await
+            .expect("execute command");
+        let payload: Value = serde_json::from_str(&first_text(&result)).unwrap();
+        let command_id = payload["commandId"].as_str().unwrap();
+
+        let result = server
+            .get_command_result(Parameters(GetCommandResultInput {
+                command_id: command_id.to_string(),
+                socket: Some("/tmp/other.sock".into()),
+            }))
+            .await
+            .expect("get command result");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("Socket override does not match"));
+    }
+
+    #[tokio::test]
     async fn get_current_session_success_and_error() {
         let mut stub = TmuxStub::new();
         let server = server_default();
@@ -4842,6 +4929,31 @@ mod tests {
     async fn read_resource_command_denied_by_policy() {
         let _stub = TmuxStub::new();
         let server = server_with_policy("[security]\nallow_execute_command = false\n");
+        let (context, _client_transport, _running) = context_for_server(&server);
+
+        let command_id = server
+            .tracker
+            .execute_command("%1", "echo hi", false, false, None, None)
+            .await
+            .expect("execute command");
+
+        let request = ReadResourceRequestParams {
+            uri: format!("tmux://command/{command_id}/result"),
+            meta: None,
+        };
+        let result = server
+            .read_resource(request, context)
+            .await
+            .expect("read resource");
+        let text = first_text_resource(&result.contents);
+        assert!(text.contains("Access denied"));
+    }
+
+    #[tokio::test]
+    async fn read_resource_command_denied_by_socket_policy() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_MCP_SOCKET", "/tmp/recorded.sock");
+        let server = server_with_policy("[security]\nallowed_sockets = [\"/tmp/allowed.sock\"]\n");
         let (context, _client_transport, _running) = context_for_server(&server);
 
         let command_id = server
