@@ -306,6 +306,11 @@ impl SecurityPolicy {
             })
         }
     }
+
+    /// Returns true if session allowlist enforcement is configured.
+    pub fn has_session_allowlist(&self) -> bool {
+        self.config.allowed_sessions.is_some()
+    }
 }
 
 #[cfg(test)]
