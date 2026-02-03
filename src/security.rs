@@ -2,6 +2,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::commands::TrackingConfig;
 use crate::errors::{Error, Result};
 
 /// Mode for applying regex-based command filters.
@@ -110,6 +111,8 @@ pub struct ConfigFile {
     pub ssh: SshConfig,
     #[serde(default)]
     pub security: SecurityConfig,
+    #[serde(default)]
+    pub tracking: TrackingConfig,
 }
 
 /// Enforces security rules derived from configuration.

@@ -13,7 +13,7 @@ use clap::Parser;
 use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::commands::CommandTracker;
+use crate::commands::{CommandTracker, TrackingConfig};
 use crate::security::{ConfigFile, SecurityPolicy};
 use crate::server::TmuxMcpServer;
 use crate::types::ShellType;
@@ -94,7 +94,7 @@ async fn main() {
 
     init_tracing();
 
-    let (security_policy, config_shell_type, config_ssh) = match &cli.config {
+    let (security_policy, config_shell_type, config_ssh, tracking_config) = match &cli.config {
         Some(path) => {
             let content = match std::fs::read_to_string(path) {
                 Ok(c) => c,
@@ -120,9 +120,19 @@ async fn main() {
                 }
             };
 
-            (policy, config_file.shell.shell_type, config_file.ssh.remote)
+            (
+                policy,
+                config_file.shell.shell_type,
+                config_file.ssh.remote,
+                config_file.tracking,
+            )
         }
-        None => (SecurityPolicy::default(), None, None),
+        None => (
+            SecurityPolicy::default(),
+            None,
+            None,
+            TrackingConfig::default(),
+        ),
     };
 
     let shell_type = config_shell_type
@@ -134,7 +144,11 @@ async fn main() {
         std::env::set_var("TMUX_MCP_SSH", ssh);
     }
 
-    let tracker = CommandTracker::new(shell_type);
+    let tracker = if cli.config.is_some() {
+        CommandTracker::with_tracking(shell_type, tracking_config)
+    } else {
+        CommandTracker::new(shell_type)
+    };
     let server = TmuxMcpServer::new(tracker, security_policy);
 
     tracing::info!("Starting tmux-mcp-rs server with stdio transport");

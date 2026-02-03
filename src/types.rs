@@ -195,4 +195,5 @@ pub struct CommandExecution {
     pub started_at: Instant,
     pub completed_at: Option<Instant>,
     pub raw_mode: bool,
+    pub tracking_disabled: bool,
 }
