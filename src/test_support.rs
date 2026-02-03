@@ -61,7 +61,31 @@ case "$cmd" in
     if [ "${TMUX_STUB_CAPTURE_OUTPUT+x}" = "x" ]; then
       printf '%b' "$TMUX_STUB_CAPTURE_OUTPUT"
     else
-      printf '%b' "prompt\nTMUX_MCP_START\nstub-output\nTMUX_MCP_DONE_0\n"
+      if [ -n "${TMUX_STUB_CAPTURE_COUNT_FILE:-}" ]; then
+        count=0
+        if [ -f "$TMUX_STUB_CAPTURE_COUNT_FILE" ]; then
+          count=$(cat "$TMUX_STUB_CAPTURE_COUNT_FILE" 2>/dev/null || echo 0)
+        fi
+        if [ -z "$count" ]; then
+          count=0
+        fi
+        count=$((count+1))
+        printf '%s' "$count" > "$TMUX_STUB_CAPTURE_COUNT_FILE"
+      fi
+
+      if [ -n "${TMUX_STUB_CAPTURE_AFTER:-}" ] && [ -n "${TMUX_STUB_CAPTURE_COUNT_FILE:-}" ]; then
+        if [ "$count" -lt "$TMUX_STUB_CAPTURE_AFTER" ]; then
+          printf '%b' "${TMUX_STUB_CAPTURE_BEFORE:-}"
+        else
+          printf '%b' "${TMUX_STUB_CAPTURE_AFTER_OUTPUT:-}"
+        fi
+      else
+        if [ -n "${TMUX_MCP_TEST_COMMAND_ID:-}" ]; then
+          printf '%b' "prompt\nTMUX_MCP_START_${TMUX_MCP_TEST_COMMAND_ID}\nstub-output\nTMUX_MCP_DONE_${TMUX_MCP_TEST_COMMAND_ID}_0\n"
+        else
+          printf '%b' "prompt\nTMUX_MCP_START_default\nstub-output\nTMUX_MCP_DONE_default_0\n"
+        fi
+      fi
     fi
     ;;
   display-message)
