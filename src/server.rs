@@ -614,6 +614,7 @@ fn hash_path_for_socket(path: &str) -> String {
 #[tool_router]
 impl TmuxMcpServer {
     /// Create a new MCP server with a command tracker and security policy.
+    #[allow(dead_code)]
     pub fn new(tracker: CommandTracker, policy: SecurityPolicy) -> Self {
         Self::new_with_search(tracker, policy, SearchConfig::default())
     }

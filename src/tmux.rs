@@ -715,15 +715,29 @@ fn decode_window(buffer: &str, bytes: &[u8], base_offset: usize) -> Result<(Stri
         end = end.saturating_sub(1);
     }
 
-    if start >= end {
-        return Ok((String::new(), base_offset.saturating_add(start)));
-    }
+    loop {
+        if start >= end {
+            return Ok((String::new(), base_offset.saturating_add(start)));
+        }
 
-    let slice = &bytes[start..end];
-    let text = std::str::from_utf8(slice).map_err(|_| Error::InvalidArgument {
-        message: format!("buffer '{buffer}' contains non-UTF-8 bytes; search requires UTF-8"),
-    })?;
-    Ok((text.to_string(), base_offset.saturating_add(start)))
+        let slice = &bytes[start..end];
+        match std::str::from_utf8(slice) {
+            Ok(text) => return Ok((text.to_string(), base_offset.saturating_add(start))),
+            Err(err) => {
+                if err.error_len().is_none() {
+                    // Truncated UTF-8 sequence at the end of the window; trim to valid prefix.
+                    let valid = err.valid_up_to();
+                    end = start.saturating_add(valid);
+                    continue;
+                }
+                return Err(Error::InvalidArgument {
+                    message: format!(
+                        "buffer '{buffer}' contains non-UTF-8 bytes; search requires UTF-8"
+                    ),
+                });
+            }
+        }
+    }
 }
 
 // rapidfuzz (feature-gated) provides fuzzy similarity scoring when requested.
