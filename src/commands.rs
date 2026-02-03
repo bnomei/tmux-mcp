@@ -57,6 +57,7 @@ impl CommandTracker {
         socket: Option<String>,
     ) -> Result<String> {
         let command_id = Uuid::new_v4().to_string();
+        let resolved_socket = tmux::resolve_socket(socket.as_deref());
 
         let (wrapped_command, tracking_disabled) = if raw_mode || no_enter {
             (command.to_string(), true)
@@ -72,7 +73,7 @@ impl CommandTracker {
         let execution = CommandExecution {
             id: command_id.clone(),
             pane_id: pane_id.to_string(),
-            socket: socket.clone(),
+            socket: resolved_socket.clone(),
             command: command.to_string(),
             status: CommandStatus::Pending,
             exit_code: None,
@@ -93,18 +94,18 @@ impl CommandTracker {
 
         if let Some(delay) = delay_ms {
             for ch in wrapped_command.chars() {
-                tmux::send_keys(pane_id, &ch.to_string(), true, socket.as_deref()).await?;
+                tmux::send_keys(pane_id, &ch.to_string(), true, resolved_socket.as_deref()).await?;
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
             if !no_enter {
-                tmux::send_keys(pane_id, "Enter", false, socket.as_deref()).await?;
+                tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await?;
             }
         } else {
             // Send command as a whole (not literal/per-character)
-            tmux::send_keys(pane_id, &wrapped_command, false, socket.as_deref()).await?;
+            tmux::send_keys(pane_id, &wrapped_command, false, resolved_socket.as_deref()).await?;
             // Send Enter if needed
             if !no_enter {
-                tmux::send_keys(pane_id, "Enter", false, socket.as_deref()).await?;
+                tmux::send_keys(pane_id, "Enter", false, resolved_socket.as_deref()).await?;
             }
         }
 
