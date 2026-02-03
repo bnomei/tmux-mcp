@@ -1025,7 +1025,7 @@ fn search_texts(
             scan_start.saturating_add(max_scan_bytes).min(window_len),
             false,
         );
-        let scan_end = window_len;
+        let scan_end = scan_limit_end;
         bytes_scanned_total += (scan_limit_end - scan_start) as u64;
         buffer_texts.push((
             buffer.clone(),
@@ -1527,7 +1527,7 @@ pub async fn search_buffers(
 ) -> Result<BufferSearchOutput> {
     let buffer_infos = list_buffers(socket).await?;
     let mut size_by_name: BTreeMap<String, u64> = BTreeMap::new();
-    for info in buffer_infos {
+    for info in &buffer_infos {
         size_by_name.insert(info.name.clone(), info.size_bytes);
     }
 
@@ -1538,7 +1538,7 @@ pub async fn search_buffers(
             names
         }
     } else {
-        size_by_name.keys().cloned().collect()
+        buffer_infos.iter().map(|info| info.name.clone()).collect()
     };
 
     let context_for_window = context_bytes.unwrap_or(DEFAULT_SEARCH_CONTEXT_BYTES) as u64;
