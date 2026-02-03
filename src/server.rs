@@ -40,9 +40,11 @@ struct SessionCacheEntry {
     expires_at: Instant,
 }
 
+type SessionCacheKey = (String, Option<String>);
+
 struct SessionScopeCache {
-    panes: HashMap<String, SessionCacheEntry>,
-    windows: HashMap<String, SessionCacheEntry>,
+    panes: HashMap<SessionCacheKey, SessionCacheEntry>,
+    windows: HashMap<SessionCacheKey, SessionCacheEntry>,
 }
 
 impl SessionScopeCache {
@@ -620,6 +622,10 @@ impl TmuxMcpServer {
         }
     }
 
+    fn session_cache_key(id: &str, socket: Option<&str>) -> SessionCacheKey {
+        (id.to_string(), socket.map(|value| value.to_string()))
+    }
+
     async fn enforce_session_for_pane(
         &self,
         pane_id: &str,
@@ -650,9 +656,10 @@ impl TmuxMcpServer {
         socket: Option<&str>,
     ) -> Result<String, crate::errors::Error> {
         let now = Instant::now();
+        let key = Self::session_cache_key(pane_id, socket);
         {
             let cache = self.session_cache.read().await;
-            if let Some(entry) = cache.panes.get(pane_id) {
+            if let Some(entry) = cache.panes.get(&key) {
                 if entry.expires_at > now {
                     return Ok(entry.session_id.clone());
                 }
@@ -668,7 +675,7 @@ impl TmuxMcpServer {
         {
             let mut cache = self.session_cache.write().await;
             cache.panes.insert(
-                pane_id.to_string(),
+                key,
                 SessionCacheEntry {
                     session_id: session_id.clone(),
                     expires_at: now + SESSION_CACHE_TTL,
@@ -684,9 +691,10 @@ impl TmuxMcpServer {
         socket: Option<&str>,
     ) -> Result<String, crate::errors::Error> {
         let now = Instant::now();
+        let key = Self::session_cache_key(window_id, socket);
         {
             let cache = self.session_cache.read().await;
-            if let Some(entry) = cache.windows.get(window_id) {
+            if let Some(entry) = cache.windows.get(&key) {
                 if entry.expires_at > now {
                     return Ok(entry.session_id.clone());
                 }
@@ -702,7 +710,7 @@ impl TmuxMcpServer {
         {
             let mut cache = self.session_cache.write().await;
             cache.windows.insert(
-                window_id.to_string(),
+                key,
                 SessionCacheEntry {
                     session_id: session_id.clone(),
                     expires_at: now + SESSION_CACHE_TTL,
