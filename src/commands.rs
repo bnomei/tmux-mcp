@@ -59,6 +59,10 @@ pub struct TrackingConfig {
     pub capture_max_lines: u32,
     #[serde(default = "default_capture_backoff_factor")]
     pub capture_backoff_factor: u32,
+    #[serde(default = "default_completed_retention_minutes")]
+    pub completed_retention_minutes: u64,
+    #[serde(default = "default_completed_max_entries")]
+    pub completed_max_entries: u32,
 }
 
 fn default_capture_initial_lines() -> u32 {
@@ -73,12 +77,22 @@ fn default_capture_backoff_factor() -> u32 {
     2
 }
 
+fn default_completed_retention_minutes() -> u64 {
+    240
+}
+
+fn default_completed_max_entries() -> u32 {
+    1000
+}
+
 impl Default for TrackingConfig {
     fn default() -> Self {
         Self {
             capture_initial_lines: default_capture_initial_lines(),
             capture_max_lines: default_capture_max_lines(),
             capture_backoff_factor: default_capture_backoff_factor(),
+            completed_retention_minutes: default_completed_retention_minutes(),
+            completed_max_entries: default_completed_max_entries(),
         }
     }
 }
@@ -156,6 +170,8 @@ impl CommandTracker {
             commands.insert(command_id.clone(), execution);
         }
 
+        self.cleanup_completed().await;
+
         if let Some(delay) = delay_ms {
             for ch in wrapped_command.chars() {
                 tmux::send_keys(pane_id, &ch.to_string(), true, resolved_socket.as_deref()).await?;
@@ -185,6 +201,8 @@ impl CommandTracker {
         command_id: &str,
         socket_override: Option<&str>,
     ) -> Result<Option<CommandExecution>> {
+        self.cleanup_completed().await;
+
         let execution = {
             let commands = self.active_commands.read().await;
             commands.get(command_id).cloned()
@@ -254,6 +272,8 @@ impl CommandTracker {
             capture_lines = (capture_lines.saturating_mul(backoff)).min(max_lines);
         }
 
+        self.cleanup_completed().await;
+
         Ok(Some(execution))
     }
 
@@ -269,20 +289,48 @@ impl CommandTracker {
         commands.keys().cloned().collect()
     }
 
-    /// Remove completed commands older than the specified threshold.
-    #[allow(dead_code)]
-    pub async fn cleanup_old(&self, max_age_minutes: u64) {
-        let threshold = Duration::from_secs(max_age_minutes * 60);
+    /// Remove completed commands outside the configured retention window and count.
+    async fn cleanup_completed(&self) {
+        let retention_minutes = self.tracking.completed_retention_minutes;
+        let retention_window = Duration::from_secs(retention_minutes.saturating_mul(60));
         let now = Instant::now();
 
         let mut commands = self.active_commands.write().await;
         commands.retain(|_, exec| {
-            if let Some(completed_at) = exec.completed_at {
-                now.duration_since(completed_at) < threshold
-            } else {
-                true
+            if exec.status == CommandStatus::Pending {
+                return true;
             }
+            let completed_at = match exec.completed_at {
+                Some(instant) => instant,
+                None => return true,
+            };
+            let age = now
+                .checked_duration_since(completed_at)
+                .unwrap_or(Duration::ZERO);
+            age < retention_window
         });
+
+        let max_entries = self.tracking.completed_max_entries as usize;
+        let mut completed: Vec<(String, Instant)> = commands
+            .iter()
+            .filter_map(|(id, exec)| {
+                if exec.status == CommandStatus::Pending {
+                    return None;
+                }
+                exec.completed_at
+                    .map(|completed_at| (id.clone(), completed_at))
+            })
+            .collect();
+
+        if completed.len() <= max_entries {
+            return;
+        }
+
+        completed.sort_by_key(|(_, completed_at)| *completed_at);
+        let excess = completed.len().saturating_sub(max_entries);
+        for (id, _) in completed.into_iter().take(excess) {
+            commands.remove(&id);
+        }
     }
 }
 
@@ -572,6 +620,7 @@ mod tests {
             capture_initial_lines: 2,
             capture_max_lines: 4,
             capture_backoff_factor: 2,
+            ..TrackingConfig::default()
         };
         let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
         let execution = CommandExecution {
@@ -617,6 +666,7 @@ mod tests {
             capture_initial_lines: 1,
             capture_max_lines: 2,
             capture_backoff_factor: 2,
+            ..TrackingConfig::default()
         };
         let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
         let execution = CommandExecution {
@@ -648,12 +698,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_old_removes_stale() {
-        let tracker = CommandTracker::new(ShellType::Bash);
+    async fn cleanup_completed_removes_old_and_preserves_pending() {
+        let tracking = TrackingConfig {
+            completed_retention_minutes: 1,
+            completed_max_entries: 1000,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
         let old_id = "old".to_string();
         let new_id = "new".to_string();
         let pending_id = "pending".to_string();
 
+        let now = Instant::now();
         let old_exec = CommandExecution {
             id: old_id.clone(),
             pane_id: "%1".into(),
@@ -662,8 +718,8 @@ mod tests {
             status: CommandStatus::Completed,
             exit_code: Some(0),
             output: Some("old".into()),
-            started_at: Instant::now(),
-            completed_at: Some(Instant::now() - Duration::from_secs(120)),
+            started_at: now,
+            completed_at: Some(now - Duration::from_secs(120)),
             raw_mode: false,
             tracking_disabled: false,
         };
@@ -675,8 +731,8 @@ mod tests {
             status: CommandStatus::Completed,
             exit_code: Some(0),
             output: Some("new".into()),
-            started_at: Instant::now(),
-            completed_at: Some(Instant::now()),
+            started_at: now,
+            completed_at: Some(now),
             raw_mode: false,
             tracking_disabled: false,
         };
@@ -688,7 +744,7 @@ mod tests {
             status: CommandStatus::Pending,
             exit_code: None,
             output: None,
-            started_at: Instant::now(),
+            started_at: now,
             completed_at: None,
             raw_mode: false,
             tracking_disabled: false,
@@ -701,11 +757,95 @@ mod tests {
             commands.insert(pending_id.clone(), pending_exec);
         }
 
-        tracker.cleanup_old(1).await;
+        tracker.cleanup_completed().await;
 
         let commands = tracker.active_commands.read().await;
         assert!(!commands.contains_key(&old_id));
         assert!(commands.contains_key(&new_id));
+        assert!(commands.contains_key(&pending_id));
+    }
+
+    #[tokio::test]
+    async fn cleanup_completed_trims_to_max_entries() {
+        let tracking = TrackingConfig {
+            completed_retention_minutes: 10,
+            completed_max_entries: 2,
+            ..TrackingConfig::default()
+        };
+        let tracker = CommandTracker::with_tracking(ShellType::Bash, tracking);
+        let oldest_id = "oldest".to_string();
+        let middle_id = "middle".to_string();
+        let newest_id = "newest".to_string();
+        let pending_id = "pending".to_string();
+
+        let now = Instant::now();
+        let oldest_exec = CommandExecution {
+            id: oldest_id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "oldest".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            output: Some("oldest".into()),
+            started_at: now,
+            completed_at: Some(now - Duration::from_secs(180)),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        let middle_exec = CommandExecution {
+            id: middle_id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "middle".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            output: Some("middle".into()),
+            started_at: now,
+            completed_at: Some(now - Duration::from_secs(120)),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        let newest_exec = CommandExecution {
+            id: newest_id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "newest".into(),
+            status: CommandStatus::Completed,
+            exit_code: Some(0),
+            output: Some("newest".into()),
+            started_at: now,
+            completed_at: Some(now - Duration::from_secs(60)),
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+        let pending_exec = CommandExecution {
+            id: pending_id.clone(),
+            pane_id: "%1".into(),
+            socket: None,
+            command: "pending".into(),
+            status: CommandStatus::Pending,
+            exit_code: None,
+            output: None,
+            started_at: now,
+            completed_at: None,
+            raw_mode: false,
+            tracking_disabled: false,
+        };
+
+        {
+            let mut commands = tracker.active_commands.write().await;
+            commands.insert(oldest_id.clone(), oldest_exec);
+            commands.insert(middle_id.clone(), middle_exec);
+            commands.insert(newest_id.clone(), newest_exec);
+            commands.insert(pending_id.clone(), pending_exec);
+        }
+
+        tracker.cleanup_completed().await;
+
+        let commands = tracker.active_commands.read().await;
+        assert!(!commands.contains_key(&oldest_id));
+        assert!(commands.contains_key(&middle_id));
+        assert!(commands.contains_key(&newest_id));
         assert!(commands.contains_key(&pending_id));
     }
 }
