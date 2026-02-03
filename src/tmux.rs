@@ -1479,14 +1479,35 @@ pub async fn send_keys(
     socket: Option<&str>,
 ) -> Result<()> {
     if literal {
-        for ch in keys.chars() {
-            let ch_str = ch.to_string();
-            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", &ch_str], socket).await?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for chunk in chunk_literal_payload(keys) {
+            execute_tmux_with_socket(&["send-keys", "-t", pane_id, "-l", &chunk], socket).await?;
         }
     } else {
         execute_tmux_with_socket(&["send-keys", "-t", pane_id, keys], socket).await?;
     }
     Ok(())
+}
+
+const MAX_LITERAL_CHUNK_BYTES: usize = 4000;
+
+fn chunk_literal_payload(keys: &str) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in keys.chars() {
+        let ch_len = ch.len_utf8();
+        if !current.is_empty() && current.len() + ch_len > MAX_LITERAL_CHUNK_BYTES {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
 }
 
 /// Get the current session (the one the client is attached to).
@@ -1677,6 +1698,8 @@ mod tests {
     use super::*;
     use crate::test_support::TmuxStub;
     use rstest::rstest;
+    use std::fs;
+    use tempfile::tempdir;
 
     #[rstest]
     #[case(
@@ -1762,6 +1785,50 @@ mod tests {
     fn test_parse_panes(#[case] input: &str, #[case] window_id: &str, #[case] expected: Vec<Pane>) {
         let result = parse_panes(input, window_id);
         assert_eq!(result, expected);
+    }
+
+    #[tokio::test]
+    async fn send_keys_literal_fast_path_single_call() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        send_keys("%1", "hello", true, None)
+            .await
+            .expect("send keys");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("-l hello"));
+    }
+
+    #[tokio::test]
+    async fn send_keys_literal_chunks_large_payload() {
+        let mut stub = TmuxStub::new();
+        let temp_dir = tempdir().expect("tempdir");
+        let log_path = temp_dir.path().join("send-keys.log");
+        stub.set_var(
+            "TMUX_STUB_SEND_KEYS_LOG",
+            log_path.to_str().expect("log path"),
+        );
+
+        let payload = "a".repeat(MAX_LITERAL_CHUNK_BYTES + 25);
+        send_keys("%1", &payload, true, None)
+            .await
+            .expect("send keys");
+
+        let log = fs::read_to_string(&log_path).expect("read log");
+        let lines: Vec<&str> = log.lines().collect();
+        assert!(lines.len() >= 2);
+        for line in lines {
+            let chunk = line.split_whitespace().last().unwrap_or("");
+            assert!(chunk.len() <= MAX_LITERAL_CHUNK_BYTES);
+        }
     }
 
     #[test]
