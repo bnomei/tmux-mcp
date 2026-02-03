@@ -20,7 +20,7 @@ use rmcp::tool_router;
 use rmcp::ErrorData as McpError;
 
 use crate::commands::CommandTracker;
-use crate::security::SecurityPolicy;
+use crate::security::{SearchConfig, SecurityPolicy};
 use crate::tmux;
 use crate::types::{
     BufferInfo, BufferSearchOutput, ClientInfo, CommandStatus, Pane, SearchMode, Session, Window,
@@ -31,6 +31,7 @@ use crate::types::{
 pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
+    search: SearchConfig,
     tool_router: ToolRouter<Self>,
     session_cache: Arc<tokio::sync::RwLock<SessionScopeCache>>,
 }
@@ -614,9 +615,18 @@ fn hash_path_for_socket(path: &str) -> String {
 impl TmuxMcpServer {
     /// Create a new MCP server with a command tracker and security policy.
     pub fn new(tracker: CommandTracker, policy: SecurityPolicy) -> Self {
+        Self::new_with_search(tracker, policy, SearchConfig::default())
+    }
+
+    pub fn new_with_search(
+        tracker: CommandTracker,
+        policy: SecurityPolicy,
+        search: SearchConfig,
+    ) -> Self {
         Self {
             tracker: Arc::new(tracker),
             policy: Arc::new(policy),
+            search,
             tool_router: Self::tool_router(),
             session_cache: Arc::new(tokio::sync::RwLock::new(SessionScopeCache::new())),
         }
@@ -1185,6 +1195,7 @@ impl TmuxMcpServer {
             fuzzy_match,
             input.0.similarity_threshold,
             input.0.resume_from_offset,
+            self.search.streaming_threshold_bytes,
             socket.as_deref(),
         )
         .await
@@ -1238,6 +1249,7 @@ impl TmuxMcpServer {
             include_similarity,
             fuzzy_match,
             input.0.similarity_threshold,
+            self.search.streaming_threshold_bytes,
             socket.as_deref(),
         )
         .await

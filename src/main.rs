@@ -14,7 +14,7 @@ use rmcp::ServiceExt;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::commands::{CommandTracker, TrackingConfig};
-use crate::security::{ConfigFile, SecurityPolicy};
+use crate::security::{ConfigFile, SearchConfig, SecurityPolicy};
 use crate::server::TmuxMcpServer;
 use crate::types::ShellType;
 
@@ -94,46 +94,49 @@ async fn main() {
 
     init_tracing();
 
-    let (security_policy, config_shell_type, config_ssh, tracking_config) = match &cli.config {
-        Some(path) => {
-            let content = match std::fs::read_to_string(path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error reading config file: {e}");
-                    std::process::exit(1);
-                }
-            };
+    let (security_policy, config_shell_type, config_ssh, tracking_config, search_config) =
+        match &cli.config {
+            Some(path) => {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error reading config file: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
-            let config_file: ConfigFile = match toml::from_str(&content) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Error parsing config file: {e}");
-                    std::process::exit(1);
-                }
-            };
+                let config_file: ConfigFile = match toml::from_str(&content) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Error parsing config file: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
-            let policy = match SecurityPolicy::load(path) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Error loading security policy: {e}");
-                    std::process::exit(1);
-                }
-            };
+                let policy = match SecurityPolicy::load(path) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Error loading security policy: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
-            (
-                policy,
-                config_file.shell.shell_type,
-                config_file.ssh.remote,
-                config_file.tracking,
-            )
-        }
-        None => (
-            SecurityPolicy::default(),
-            None,
-            None,
-            TrackingConfig::default(),
-        ),
-    };
+                (
+                    policy,
+                    config_file.shell.shell_type,
+                    config_file.ssh.remote,
+                    config_file.tracking,
+                    config_file.search,
+                )
+            }
+            None => (
+                SecurityPolicy::default(),
+                None,
+                None,
+                TrackingConfig::default(),
+                SearchConfig::default(),
+            ),
+        };
 
     let shell_type = config_shell_type
         .map(|s| parse_shell_type(&s))
@@ -149,7 +152,7 @@ async fn main() {
     } else {
         CommandTracker::new(shell_type)
     };
-    let server = TmuxMcpServer::new(tracker, security_policy);
+    let server = TmuxMcpServer::new_with_search(tracker, security_policy, search_config);
 
     tracing::info!("Starting tmux-mcp-rs server with stdio transport");
 
