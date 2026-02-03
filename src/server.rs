@@ -2,9 +2,9 @@
 //!
 //! This module registers all tools and resources using the rmcp crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -32,7 +32,31 @@ pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     tool_router: ToolRouter<Self>,
+    session_cache: Arc<tokio::sync::RwLock<SessionScopeCache>>,
 }
+
+struct SessionCacheEntry {
+    session_id: String,
+    expires_at: Instant,
+}
+
+type SessionCacheKey = (String, Option<String>);
+
+struct SessionScopeCache {
+    panes: HashMap<SessionCacheKey, SessionCacheEntry>,
+    windows: HashMap<SessionCacheKey, SessionCacheEntry>,
+}
+
+impl SessionScopeCache {
+    fn new() -> Self {
+        Self {
+            panes: HashMap::new(),
+            windows: HashMap::new(),
+        }
+    }
+}
+
+const SESSION_CACHE_TTL: Duration = Duration::from_secs(5);
 
 fn structured_output<T: Serialize>(value: &T) -> CallToolResult {
     match serde_json::to_value(value) {
@@ -594,7 +618,106 @@ impl TmuxMcpServer {
             tracker: Arc::new(tracker),
             policy: Arc::new(policy),
             tool_router: Self::tool_router(),
+            session_cache: Arc::new(tokio::sync::RwLock::new(SessionScopeCache::new())),
         }
+    }
+
+    fn session_cache_key(id: &str, socket: Option<&str>) -> SessionCacheKey {
+        (id.to_string(), socket.map(|value| value.to_string()))
+    }
+
+    async fn enforce_session_for_pane(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+    ) -> Result<(), crate::errors::Error> {
+        if !self.policy.has_session_allowlist() {
+            return Ok(());
+        }
+        let session_id = self.session_for_pane(pane_id, socket).await?;
+        self.policy.check_session(&session_id)
+    }
+
+    async fn enforce_session_for_window(
+        &self,
+        window_id: &str,
+        socket: Option<&str>,
+    ) -> Result<(), crate::errors::Error> {
+        if !self.policy.has_session_allowlist() {
+            return Ok(());
+        }
+        let session_id = self.session_for_window(window_id, socket).await?;
+        self.policy.check_session(&session_id)
+    }
+
+    async fn session_for_pane(
+        &self,
+        pane_id: &str,
+        socket: Option<&str>,
+    ) -> Result<String, crate::errors::Error> {
+        let now = Instant::now();
+        let key = Self::session_cache_key(pane_id, socket);
+        {
+            let cache = self.session_cache.read().await;
+            if let Some(entry) = cache.panes.get(&key) {
+                if entry.expires_at > now {
+                    return Ok(entry.session_id.clone());
+                }
+            }
+        }
+
+        let info = tmux::pane_info(pane_id, socket).await.map_err(|_| {
+            crate::errors::Error::PolicyDenied {
+                message: format!("unable to resolve session for pane '{pane_id}'"),
+            }
+        })?;
+        let session_id = info.session_id.clone();
+        {
+            let mut cache = self.session_cache.write().await;
+            cache.panes.insert(
+                key,
+                SessionCacheEntry {
+                    session_id: session_id.clone(),
+                    expires_at: now + SESSION_CACHE_TTL,
+                },
+            );
+        }
+        Ok(session_id)
+    }
+
+    async fn session_for_window(
+        &self,
+        window_id: &str,
+        socket: Option<&str>,
+    ) -> Result<String, crate::errors::Error> {
+        let now = Instant::now();
+        let key = Self::session_cache_key(window_id, socket);
+        {
+            let cache = self.session_cache.read().await;
+            if let Some(entry) = cache.windows.get(&key) {
+                if entry.expires_at > now {
+                    return Ok(entry.session_id.clone());
+                }
+            }
+        }
+
+        let info = tmux::window_info(window_id, socket).await.map_err(|_| {
+            crate::errors::Error::PolicyDenied {
+                message: format!("unable to resolve session for window '{window_id}'"),
+            }
+        })?;
+        let session_id = info.session_id.clone();
+        {
+            let mut cache = self.session_cache.write().await;
+            cache.windows.insert(
+                key,
+                SessionCacheEntry {
+                    session_id: session_id.clone(),
+                    expires_at: now + SESSION_CACHE_TTL,
+                },
+            );
+        }
+        Ok(session_id)
     }
 
     // Core tools
@@ -721,6 +844,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::list_panes(&input.0.window_id, socket.as_deref()).await {
             Ok(panes) => Ok(structured_output(&ListPanesOutput { panes })),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
@@ -796,6 +925,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::capture_pane(
@@ -1184,6 +1319,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::split_pane(
             &input.0.pane_id,
             input.0.direction.as_deref(),
@@ -1245,6 +1386,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::kill_window(&input.0.window_id, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Window {} has been killed",
@@ -1270,6 +1417,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::kill_pane(&input.0.pane_id, socket.as_deref()).await {
@@ -1301,6 +1454,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         let raw_mode = input.0.raw_mode.unwrap_or(false);
@@ -1492,6 +1651,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::rename_window(&input.0.window_id, &input.0.name, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Window {} renamed to {}",
@@ -1522,6 +1687,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::rename_pane(&input.0.pane_id, &input.0.title, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Pane {} title set to {}",
@@ -1547,6 +1718,12 @@ impl TmuxMcpServer {
         }
         let socket = tmux::resolve_socket(input.0.socket.as_deref());
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_session(&input.0.target_session_id) {
@@ -1585,6 +1762,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::select_window(&input.0.window_id, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Window {} selected",
@@ -1614,6 +1797,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::select_pane(&input.0.pane_id, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Pane {} selected",
@@ -1641,6 +1830,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::resize_pane(
@@ -1678,6 +1873,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::zoom_pane(&input.0.pane_id, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Pane {} zoom toggled",
@@ -1703,6 +1904,12 @@ impl TmuxMcpServer {
         }
         let socket = tmux::resolve_socket(input.0.socket.as_deref());
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::select_layout(&input.0.window_id, &input.0.layout, socket.as_deref()).await {
@@ -1735,6 +1942,18 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.target_pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.source_pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.target_pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::join_pane(
@@ -1773,6 +1992,12 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
         match tmux::break_pane(&input.0.pane_id, input.0.name.as_deref(), socket.as_deref()).await {
             Ok(window) => Ok(structured_output(&window)),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
@@ -1800,6 +2025,18 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.target_pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.source_pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.target_pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::swap_pane(
@@ -1833,6 +2070,12 @@ impl TmuxMcpServer {
         }
         let socket = tmux::resolve_socket(input.0.socket.as_deref());
         if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_window(&input.0.window_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::set_synchronize_panes(&input.0.window_id, input.0.enabled, socket.as_deref())
@@ -1893,6 +2136,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         let literal = input.0.literal.unwrap_or(false);
@@ -2185,6 +2434,12 @@ impl TmuxMcpServer {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         if let Err(e) = self.policy.check_pane(pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(pane_id, socket.as_deref())
+            .await
+        {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
         match tmux::send_keys(pane_id, key, false, socket.as_deref()).await {
@@ -2574,6 +2829,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                 });
             }
+            if let Err(e) = self
+                .enforce_session_for_pane(pane_id, socket.as_deref())
+                .await
+            {
+                return Ok(rmcp::model::ReadResourceResult {
+                    contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
+                });
+            }
             match parts.as_slice() {
                 [pane_id] => match tmux::capture_pane(
                     pane_id,
@@ -2677,6 +2940,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                     });
                 }
                 if let Err(e) = self.policy.check_tool("list-windows") {
+                    return Ok(rmcp::model::ReadResourceResult {
+                        contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
+                    });
+                }
+                if let Err(e) = self
+                    .enforce_session_for_window(window_id, socket.as_deref())
+                    .await
+                {
                     return Ok(rmcp::model::ReadResourceResult {
                         contents: vec![ResourceContents::text(format!("Access denied: {e}"), uri)],
                     });
@@ -3496,6 +3767,78 @@ mod tests {
             .await
             .expect("move window");
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn pane_tools_respect_allowed_sessions() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CURRENT_SESSION_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/Users\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .capture_pane(Parameters(CapturePaneInput {
+                pane_id: "%1".into(),
+                lines: None,
+                colors: None,
+                start: None,
+                end: None,
+                join: None,
+                socket: None,
+            }))
+            .await
+            .expect("capture pane");
+
+        assert_eq!(result.is_error, Some(false));
+    }
+
+    #[tokio::test]
+    async fn pane_tools_deny_unlisted_sessions() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CURRENT_SESSION_OUTPUT",
+            "%1\t@1\t%1\t1\tpane-one\t/Users\tbash\t80\t24\t1234\t0",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%2\"]\n");
+
+        let result = server
+            .capture_pane(Parameters(CapturePaneInput {
+                pane_id: "%1".into(),
+                lines: None,
+                colors: None,
+                start: None,
+                end: None,
+                join: None,
+                socket: None,
+            }))
+            .await
+            .expect("capture pane");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%1' is not in allowed sessions list"));
+    }
+
+    #[tokio::test]
+    async fn window_tools_deny_unlisted_sessions() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CURRENT_SESSION_OUTPUT",
+            "@1\tfirst\t%1\t1\teven-horizontal\t2\t80\t24\t0\t%1",
+        );
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%2\"]\n");
+
+        let result = server
+            .list_panes(Parameters(WindowIdInput {
+                window_id: "@1".into(),
+                socket: None,
+            }))
+            .await
+            .expect("list panes");
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("session '%1' is not in allowed sessions list"));
     }
 
     #[tokio::test]
