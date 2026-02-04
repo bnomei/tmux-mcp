@@ -32,6 +32,25 @@ pub struct SshConfig {
     pub remote: Option<String>,
 }
 
+/// Search configuration loaded from config.toml.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchConfig {
+    #[serde(default = "default_streaming_threshold_bytes")]
+    pub streaming_threshold_bytes: u64,
+}
+
+fn default_streaming_threshold_bytes() -> u64 {
+    262_144
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self {
+            streaming_threshold_bytes: default_streaming_threshold_bytes(),
+        }
+    }
+}
+
 /// Regex-based command filtering configuration.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CommandFilter {
@@ -113,6 +132,8 @@ pub struct ConfigFile {
     pub security: SecurityConfig,
     #[serde(default)]
     pub tracking: TrackingConfig,
+    #[serde(default)]
+    pub search: SearchConfig,
 }
 
 /// Enforces security rules derived from configuration.
