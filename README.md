@@ -133,11 +133,34 @@ remote = "user@host"
 [security]
 enabled = true
 allow_execute_command = true
+allowed_sockets = ["/tmp/ai-agent.sock"]
+allowed_sessions = ["workspace"]
+allowed_panes = ["%1"]
 
 [security.command_filter]
 mode = "off" # off | allowlist | denylist
 patterns = []
+
+[tracking]
+capture_initial_lines = 1000
+capture_max_lines = 16000
+capture_backoff_factor = 2
+completed_retention_minutes = 240
+completed_max_entries = 1000
+
+[search]
+streaming_threshold_bytes = 262144
 ```
+
+### Tracking configuration (optional)
+- `capture_initial_lines`: initial number of lines to capture for command output.
+- `capture_max_lines`: maximum lines to capture before giving up.
+- `capture_backoff_factor`: multiplier for each capture retry window.
+- `completed_retention_minutes`: age threshold for evicting completed command history.
+- `completed_max_entries`: max number of completed commands retained.
+
+### Search configuration (optional)
+- `streaming_threshold_bytes`: when a buffer exceeds this size, search streams a window via a temp file instead of loading the full buffer in memory.
 
 ## Tools
 
@@ -359,6 +382,9 @@ By default, the security policy is permissive to avoid breaking agent workflows:
 **Denylist behavior:** when `command_filter.mode = "denylist"`, any regex in
 `security.command_filter.patterns` that matches a command string will block that
 command. This applies to `execute-command` and non-literal `send-keys` only.
+
+Command results are socket-bound: when a command is executed, the resolved socket is recorded
+and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.
 
 To harden a deployment, flip specific `allow_*` flags, add deny/allow patterns,
 or restrict sockets/sessions/panes explicitly.
