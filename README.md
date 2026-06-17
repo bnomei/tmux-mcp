@@ -187,6 +187,66 @@ tracking_deadline_seconds = 600
 streaming_threshold_bytes = 262144
 ```
 
+### Security defaults and controls
+
+By default, `tmux-mcp-rs` is intentionally permissive. If you do not provide a
+`config.toml`, security policy enforcement is enabled but every operation group
+is allowed, command filtering is off, and sockets, sessions, and panes are not
+restricted. This means an MCP client can create and kill tmux objects, send raw
+PTY input, run shell commands, capture pane and buffer contents, and target any
+tmux socket reachable by the process. Use an isolated socket per agent whenever
+possible.
+
+The settings below are the runtime controls that affect command, capture, and
+socket behavior:
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `security.enabled` | `true` | Turns policy checks on. Set to `false` only to bypass all security policy checks. |
+| `security.allow_execute_command` | `true` | Allows `execute-command` and `get-command-result`. `execute-command` is the only shell-input path checked by `security.command_filter`. |
+| `security.command_filter` | `mode = "off"` | Applies regex allowlist or denylist checks to each non-empty line passed to `execute-command`. It does not cover raw input tools such as `send-keys` or `paste-text`. |
+| `security.allow_send_keys` | `true` | Allows raw PTY input tools (`send-keys`, `send-hex`, `paste-text`, and special-key helpers). Disable this or deny `@raw-input` to prevent typing directly into panes. |
+| `security.allow_capture` | `true` | Allows `capture-pane` and buffer read/write/search tools, so clients can read pane output and tmux buffers. Set to `false` to block capture and buffer tools. |
+| `security.allow_list` | `true` | Allows session/window/pane/client/buffer listing and discovery tools. |
+| `security.allowed_sockets` | unset | When unset, the default tmux server and any provided socket override are accepted. When set, socket overrides must exactly match one of the listed socket paths; calls without a socket still use the default socket. |
+| `security.allowed_sessions` | unset | When set, operations scoped to a session/window/pane are limited to the listed tmux session IDs. |
+| `security.allowed_panes` | unset | When set, direct pane operations are limited to the listed pane IDs. |
+| `security.tools` | deny mode with no items | Filters the advertised and callable tool surface. Deny mode removes listed tools/groups; allow mode exposes only listed tools/groups. |
+| `shell.type` / `--shell-type` | `bash` | Selects the shell used for shell-aware command wrapping (`bash`, `zsh`, or `fish`). It is not a security boundary. |
+| `--socket` / `TMUX_MCP_SOCKET` | unset | Sets this server process's default tmux socket. Combine with `allowed_sockets` to keep the process on an isolated socket. |
+
+Examples for tightening a local setup without introducing a profile system:
+
+```toml
+# Keep one agent on one isolated tmux socket.
+[security]
+allowed_sockets = ["/tmp/tmux-mcp-agent.sock"]
+```
+
+```toml
+# Force shell input through execute-command and regex filtering.
+[security]
+allow_send_keys = false
+command_filter = { mode = "allowlist", patterns = ["^cargo ", "^git ", "^npm (test|run )"] }
+
+[security.tools]
+mode = "deny"
+items = ["@raw-input"]
+```
+
+```toml
+# Read/list plus tracked command execution only; no create, split, kill, move, or raw input tools.
+[security.tools]
+mode = "allow"
+items = ["@read", "execute-command"]
+```
+
+```toml
+# Prevent clients from reading pane contents or tmux buffers.
+[security]
+allow_capture = false
+```
+
 ### Tracking configuration (optional)
 - `capture_initial_lines`: initial number of lines to capture for command output.
 - `capture_max_lines`: maximum lines to capture before giving up.
