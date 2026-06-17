@@ -4517,7 +4517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_command_result_rejects_socket_override_when_recorded_none() {
+    async fn get_command_result_rejects_mismatched_socket_override_when_default_recorded() {
         let mut stub = TmuxStub::new();
         stub.remove_var("TMUX_MCP_SOCKET");
         let server = server_default();
@@ -4545,7 +4545,7 @@ mod tests {
             .expect("get command result");
 
         assert_eq!(result.is_error, Some(true));
-        assert!(first_text(&result).contains("Socket override is not allowed"));
+        assert!(first_text(&result).contains("Socket override does not match"));
     }
 
     #[tokio::test]
