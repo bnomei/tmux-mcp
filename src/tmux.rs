@@ -313,7 +313,7 @@ async fn execute_tmux_with_socket_to_file(
 /// Execute a tmux command with the given arguments and return stdout.
 pub async fn execute_tmux_with_socket(args: &[&str], socket: Option<&str>) -> Result<String> {
     let stdout = execute_tmux_with_socket_bytes(args, socket, None).await?;
-    Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+    Ok(String::from_utf8_lossy(&stdout).to_string())
 }
 
 /// Execute a tmux command using the default socket (if configured).
@@ -484,7 +484,7 @@ pub fn parse_buffers(output: &str) -> Vec<BufferInfo> {
 pub async fn list_sessions(socket: Option<&str>) -> Result<Vec<Session>> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
     let output = execute_tmux_with_socket(&["list-sessions", "-F", format], socket).await?;
-    Ok(parse_sessions(&output))
+    Ok(parse_sessions(output.trim()))
 }
 
 /// Find a session by name.
@@ -498,7 +498,7 @@ pub async fn list_windows(session_id: &str, socket: Option<&str>) -> Result<Vec<
     let format = "#{window_id}\t#{window_name}\t#{?window_active,1,0}";
     let output =
         execute_tmux_with_socket(&["list-windows", "-t", session_id, "-F", format], socket).await?;
-    Ok(parse_windows(&output, session_id))
+    Ok(parse_windows(output.trim(), session_id))
 }
 
 /// List panes in a window.
@@ -506,7 +506,7 @@ pub async fn list_panes(window_id: &str, socket: Option<&str>) -> Result<Vec<Pan
     let format = "#{pane_id}\t#{pane_title}\t#{?pane_active,1,0}";
     let output =
         execute_tmux_with_socket(&["list-panes", "-t", window_id, "-F", format], socket).await?;
-    Ok(parse_panes(&output, window_id))
+    Ok(parse_panes(output.trim(), window_id))
 }
 
 /// Capture content from a pane.
@@ -560,7 +560,7 @@ pub async fn list_clients(socket: Option<&str>) -> Result<Vec<ClientInfo>> {
     let format =
         "#{client_tty}\t#{client_name}\t#{client_session}\t#{client_pid}\t#{?client_attached,1,0}";
     match execute_tmux_with_socket(&["list-clients", "-F", format], socket).await {
-        Ok(output) => Ok(parse_clients(&output)),
+        Ok(output) => Ok(parse_clients(output.trim())),
         Err(Error::Tmux { ref message }) if message.contains("no clients") => Ok(Vec::new()),
         Err(e) => Err(e),
     }
@@ -576,7 +576,7 @@ pub async fn detach_client(client_tty: &str, socket: Option<&str>) -> Result<()>
 pub async fn list_buffers(socket: Option<&str>) -> Result<Vec<BufferInfo>> {
     let format = "#{buffer_name}\t#{buffer_size}\t#{buffer_created}";
     match execute_tmux_with_socket(&["list-buffers", "-F", format], socket).await {
-        Ok(output) => Ok(parse_buffers(&output)),
+        Ok(output) => Ok(parse_buffers(output.trim())),
         Err(Error::Tmux { ref message }) if message.contains("no buffers") => Ok(Vec::new()),
         Err(e) => Err(e),
     }
@@ -1758,7 +1758,7 @@ pub async fn create_session(name: &str, socket: Option<&str>) -> Result<Session>
     )
     .await?;
 
-    if let Some(session) = parse_sessions(&output).into_iter().next() {
+    if let Some(session) = parse_sessions(output.trim()).into_iter().next() {
         return Ok(session);
     }
 
@@ -1790,7 +1790,7 @@ pub async fn create_window(session_id: &str, name: &str, socket: Option<&str>) -
     )
     .await?;
 
-    if let Some(window) = parse_windows(&output, session_id).into_iter().next() {
+    if let Some(window) = parse_windows(output.trim(), session_id).into_iter().next() {
         return Ok(window);
     }
 
@@ -1843,7 +1843,7 @@ pub async fn split_pane(
 
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    if let Some(pane) = parse_panes(&output, &source_pane.window_id)
+    if let Some(pane) = parse_panes(output.trim(), &source_pane.window_id)
         .into_iter()
         .next()
     {
@@ -2003,7 +2003,7 @@ pub async fn get_current_session(socket: Option<&str>) -> Result<Session> {
     let format = "#{session_id}\t#{session_name}\t#{?session_attached,1,0}\t#{session_windows}";
     let output = execute_tmux_with_socket(&["display-message", "-p", format], socket).await?;
 
-    let sessions = parse_sessions(&output);
+    let sessions = parse_sessions(output.trim());
     sessions.into_iter().next().ok_or_else(|| Error::Tmux {
         message: "current session not found".to_string(),
     })
@@ -2117,7 +2117,7 @@ pub async fn break_pane(pane_id: &str, name: Option<&str>, socket: Option<&str>)
     }
     let output = execute_tmux_with_socket(&args, socket).await?;
 
-    if let Some(window) = parse_windows(&output, &source_pane.session_id)
+    if let Some(window) = parse_windows(output.trim(), &source_pane.session_id)
         .into_iter()
         .next()
     {
@@ -2524,6 +2524,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_tmux_preserves_raw_stdout_whitespace() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "  leading space\ntrailing space  \n\n",
+        );
+
+        let output = execute_tmux(&["capture-pane", "-p"])
+            .await
+            .expect("execute tmux");
+
+        assert_eq!(output, "  leading space\ntrailing space  \n\n");
+    }
+
+    #[tokio::test]
+    async fn list_parsers_trim_executor_output_boundaries() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_LIST_SESSIONS",
+            "  \n%1\talpha\t1\t2\n%2\tbeta\t0\t1\n  \n",
+        );
+
+        let sessions = list_sessions(None).await.expect("list sessions");
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].name, "alpha");
+        assert_eq!(sessions[1].name, "beta");
+    }
+
+    #[tokio::test]
     async fn execute_tmux_spawn_error() {
         let mut stub = TmuxStub::new();
         stub.set_var("PATH", "/nonexistent");
@@ -2751,6 +2781,33 @@ mod tests {
             .await
             .expect("capture pane");
         assert!(content.contains("stub-output"));
+    }
+
+    #[tokio::test]
+    async fn capture_pane_preserves_significant_whitespace() {
+        let mut stub = TmuxStub::new();
+        stub.set_var(
+            "TMUX_STUB_CAPTURE_OUTPUT",
+            "  indented pane line\nends with spaces  \n\n",
+        );
+
+        let content = capture_pane("%1", Some(10), false, None, None, false, None)
+            .await
+            .expect("capture pane");
+
+        assert_eq!(content, "  indented pane line\nends with spaces  \n\n");
+    }
+
+    #[tokio::test]
+    async fn show_buffer_preserves_significant_whitespace() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_SHOW_BUFFER", "  buffer value  \n\n");
+
+        let content = show_buffer(Some("buffer0"), None)
+            .await
+            .expect("show buffer");
+
+        assert_eq!(content, "  buffer value  \n\n");
     }
 
     #[tokio::test]
