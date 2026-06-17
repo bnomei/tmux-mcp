@@ -247,6 +247,8 @@ Known groups:
 | `@kill` | `kill-session`, `kill-window`, `kill-pane`, `detach-client` |
 | `@socket` | `socket-for-path` |
 
+Buffer file operations (`save-buffer` and `load-buffer`) are intentionally part of the existing capture permission surface: `[security].allow_capture = false` denies them alongside `capture-pane` and buffer inspection tools. Use `[security.tools]` for finer-grained filtering (for example, deny `save-buffer`, `load-buffer`, or `@buffer-write`) when capture should remain available but filesystem-backed buffer import/export should not. No separate `allow_buffer_read` or `allow_buffer_write` configuration exists.
+
 ## Tools
 
 ### Core Utilities
@@ -294,12 +296,12 @@ Known groups:
 ### Buffer Management
 - **list-buffers** - List tmux paste buffers
 - **show-buffer** - Show buffer contents (supports offset/max bytes; defaults to 64KB)
-- **save-buffer** - Save buffer contents to a file
+- **save-buffer** - Save buffer contents to a file (writes to the server filesystem; governed by `allow_capture` and `[security.tools]`)
 - **delete-buffer** - Delete a buffer
 
 ### Additional Buffer Tools
 - **set-buffer** - Create or replace a buffer with UTF-8 content
-- **load-buffer** - Load buffer contents from a file
+- **load-buffer** - Load buffer contents from a file (reads from the server filesystem; governed by `allow_capture` and `[security.tools]`)
 - **append-buffer** - Append UTF-8 content to an existing buffer
 - **rename-buffer** - Emulate rename by copying then deleting
 - **search-buffer** - Structured search over one or more buffers (literal/regex + metadata)

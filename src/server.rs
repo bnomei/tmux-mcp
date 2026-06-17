@@ -3458,6 +3458,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffer_file_operations_allowed_by_capture_policy() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy("[security]\nallow_capture = true\n");
+
+        let result = server
+            .load_buffer(Parameters(LoadBufferInput {
+                name: "buffer0".into(),
+                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                socket: None,
+            }))
+            .await
+            .expect("load buffer");
+        assert_eq!(result.is_error, Some(false));
+        assert!(first_text(&result).contains("loaded"));
+
+        let result = server
+            .save_buffer(Parameters(SaveBufferInput {
+                name: "buffer0".into(),
+                path: "/tmp/buffer.txt".into(),
+                socket: None,
+            }))
+            .await
+            .expect("save buffer");
+        assert_eq!(result.is_error, Some(false));
+        assert!(first_text(&result).contains("saved"));
+    }
+
+    #[tokio::test]
+    async fn buffer_file_operations_denied_by_capture_policy() {
+        let server = server_with_policy("[security]\nallow_capture = false\n");
+
+        let result = server
+            .load_buffer(Parameters(LoadBufferInput {
+                name: "buffer0".into(),
+                path: "tests/fixtures/old-man-and-the-sea.txt".into(),
+                socket: None,
+            }))
+            .await
+            .expect("load buffer");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("not allowed by security policy"));
+
+        let result = server
+            .save_buffer(Parameters(SaveBufferInput {
+                name: "buffer0".into(),
+                path: "/tmp/buffer.txt".into(),
+                socket: None,
+            }))
+            .await
+            .expect("save buffer");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("not allowed by security policy"));
+    }
+
+    #[tokio::test]
     async fn save_delete_and_detach_happy_path() {
         let _stub = TmuxStub::new();
         let server = server_default();
