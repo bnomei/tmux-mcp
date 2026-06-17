@@ -40,12 +40,14 @@ struct Cli {
     ssh: Option<String>,
 }
 
-fn parse_shell_type(s: &str) -> ShellType {
+fn parse_shell_type(s: &str) -> Result<ShellType, String> {
     match s.to_lowercase().as_str() {
-        "bash" => ShellType::Bash,
-        "zsh" => ShellType::Zsh,
-        "fish" => ShellType::Fish,
-        _ => ShellType::Bash,
+        "bash" => Ok(ShellType::Bash),
+        "zsh" => Ok(ShellType::Zsh),
+        "fish" => Ok(ShellType::Fish),
+        _ => Err(format!(
+            "unknown shell type \"{s}\", expected one of: bash, zsh, fish"
+        )),
     }
 }
 
@@ -144,9 +146,14 @@ async fn main() {
             ),
         };
 
-    let shell_type = config_shell_type
-        .map(|s| parse_shell_type(&s))
-        .unwrap_or_else(|| parse_shell_type(&cli.shell_type));
+    let shell_type_source = config_shell_type.as_deref().unwrap_or(&cli.shell_type);
+    let shell_type = match parse_shell_type(shell_type_source) {
+        Ok(shell_type) => shell_type,
+        Err(e) => {
+            eprintln!("Error parsing shell type: {e}");
+            std::process::exit(1);
+        }
+    };
 
     let ssh_connection = cli.ssh.or(config_ssh).or_else(|| {
         std::env::var("TMUX_MCP_SSH")
@@ -221,14 +228,20 @@ mod tests {
 
     #[test]
     fn parse_shell_type_recognizes_known_shells() {
-        assert_eq!(parse_shell_type("bash"), ShellType::Bash);
-        assert_eq!(parse_shell_type("zsh"), ShellType::Zsh);
-        assert_eq!(parse_shell_type("fish"), ShellType::Fish);
+        assert_eq!(parse_shell_type("bash"), Ok(ShellType::Bash));
+        assert_eq!(parse_shell_type("zsh"), Ok(ShellType::Zsh));
+        assert_eq!(parse_shell_type("fish"), Ok(ShellType::Fish));
     }
 
     #[test]
-    fn parse_shell_type_is_case_insensitive_and_defaults() {
-        assert_eq!(parse_shell_type("ZSH"), ShellType::Zsh);
-        assert_eq!(parse_shell_type("unknown"), ShellType::Bash);
+    fn parse_shell_type_is_case_insensitive() {
+        assert_eq!(parse_shell_type("ZSH"), Ok(ShellType::Zsh));
+    }
+
+    #[test]
+    fn parse_shell_type_rejects_unknown_shells() {
+        let err = parse_shell_type("unknown").expect_err("unknown shell should fail");
+        assert!(err.contains("unknown shell type \"unknown\""));
+        assert!(err.contains("bash, zsh, fish"));
     }
 }

@@ -126,6 +126,48 @@ fn cli_rejects_invalid_tools_env() {
 }
 
 #[test]
+fn cli_accepts_valid_shell_type_and_exits_when_stdio_closed() {
+    let output =
+        run_with_stdin_closed(&["--shell-type", "fish", "--socket", "/tmp/tmux-test.sock"]);
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Failed to start server"));
+    assert!(!stderr.contains("Error parsing shell type"));
+}
+
+#[test]
+fn cli_rejects_invalid_shell_type() {
+    let output = command()
+        .args(["--shell-type", "powershell"])
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Error parsing shell type"));
+    assert!(stderr.contains("unknown shell type \"powershell\""));
+    assert!(stderr.contains("expected one of: bash, zsh, fish"));
+}
+
+#[test]
+fn cli_rejects_invalid_config_shell_type() {
+    let mut file = NamedTempFile::new().expect("temp config");
+    writeln!(file, "[shell]\ntype = \"powershell\"").expect("write config");
+
+    let output = command()
+        .args(["--config", file.path().to_str().unwrap()])
+        .output()
+        .expect("run binary");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Error parsing shell type"));
+    assert!(stderr.contains("unknown shell type \"powershell\""));
+    assert!(stderr.contains("expected one of: bash, zsh, fish"));
+}
+
+#[test]
 fn cli_exits_when_stdio_closed() {
     let output = run_with_stdin_closed(&["--socket", "/tmp/tmux-test.sock"]);
     assert!(!output.status.success());
