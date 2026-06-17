@@ -149,7 +149,7 @@ Add the Quick Start snippet to your MCP client config. Example below includes al
 | `--ssh <CONNECTION>` | Run tmux over SSH (options + destination, destination last) | None |
 | `--config <PATH>` | Path to TOML configuration file | None |
 
-Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`. `TMUX_MCP_TOOLS` can override the configured tool surface for one process.
+Environment variables: `TMUX_MCP_SOCKET` can also set the socket path (recommend per-agent isolated socket id). If neither `--socket` nor `TMUX_MCP_SOCKET` is set, tmux-mcp uses tmux's default socket path (`$TMUX_TMPDIR/tmux-$UID/default`, or `/tmp/tmux-$UID/default` when `TMUX_TMPDIR` is unset). `TMUX_MCP_SSH` can set the SSH connection string and is parsed with the same startup validation as `--ssh`. `TMUX_MCP_TOOLS` can override the configured tool surface for one process.
 
 ### Sample Configuration (config.toml)
 
@@ -481,6 +481,8 @@ anticipate, so do not rely on the denylist as a hard boundary for raw input.
 Literal `send-keys` is gated by `allow_send_keys` only; its content is not
 screened. Scope raw input tools with `allowed_panes`/`allowed_sessions`, or
 disable `allow_send_keys`.
+
+When `allowed_sockets` is configured, it is enforced against the effective socket for every tool and resource request: an explicit tool socket wins, otherwise `TMUX_MCP_SOCKET`/`--socket` is used, and otherwise tmux's default socket path is checked. Include the default socket path in `allowed_sockets` only if default-server access is intended; otherwise set `--socket` or `TMUX_MCP_SOCKET` to an allowed isolated socket.
 
 Command results are socket-bound: when a command is executed, the resolved socket is recorded
 and `get-command-result` must use the same socket (explicitly or via defaults), or it will be denied.

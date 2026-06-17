@@ -69,17 +69,32 @@ struct BufferScanResult {
     fuzzy_skipped_bytes: u64,
 }
 
-/// Resolve the tmux socket path from an override or environment variable.
+/// Return tmux's default socket path for the current user.
+///
+/// tmux uses `$TMUX_TMPDIR` when set, otherwise `/tmp`, with sockets stored
+/// under a `tmux-$UID` directory and the default socket named `default`.
+pub fn default_socket_path() -> String {
+    let base = std::env::var("TMUX_TMPDIR")
+        .ok()
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "/tmp".to_string());
+    let uid = unsafe { libc::getuid() };
+    Path::new(&base)
+        .join(format!("tmux-{uid}"))
+        .join("default")
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Resolve the effective tmux socket path from an override, environment variable,
+/// or tmux's default socket path.
 pub fn resolve_socket(socket: Option<&str>) -> Option<String> {
-    if let Some(socket) = socket {
-        if socket.is_empty() {
-            return None;
-        }
+    if let Some(socket) = socket.filter(|socket| !socket.is_empty()) {
         return Some(socket.to_string());
     }
     match std::env::var("TMUX_MCP_SOCKET") {
         Ok(socket) if !socket.is_empty() => Some(socket),
-        _ => None,
+        _ => Some(default_socket_path()),
     }
 }
 
@@ -2915,10 +2930,10 @@ mod tests {
             resolve_socket(Some("/tmp/override.sock")),
             Some("/tmp/override.sock".to_string())
         );
-        assert_eq!(resolve_socket(Some("")), None);
+        assert_eq!(resolve_socket(Some("")), Some("/tmp/env.sock".to_string()));
 
         stub.set_var("TMUX_MCP_SOCKET", "");
-        assert_eq!(resolve_socket(None), None);
+        assert_eq!(resolve_socket(None), Some(default_socket_path()));
     }
 
     #[tokio::test]

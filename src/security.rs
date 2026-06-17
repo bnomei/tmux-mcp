@@ -686,7 +686,9 @@ impl SecurityPolicy {
         match &self.config.allowed_sockets {
             None => Ok(()),
             Some(allowed) => match socket {
-                None => Ok(()),
+                None => Err(Error::PolicyDenied {
+                    message: "effective socket is not in allowed sockets list".to_string(),
+                }),
                 Some(socket) => {
                     if allowed.iter().any(|s| s == socket) {
                         Ok(())
@@ -898,7 +900,7 @@ mod tests {
 
         assert!(policy.check_socket(Some("/tmp/allowed.sock")).is_ok());
         assert!(policy.check_socket(Some("/tmp/other.sock")).is_err());
-        assert!(policy.check_socket(None).is_ok());
+        assert!(policy.check_socket(None).is_err());
     }
 
     #[test]
