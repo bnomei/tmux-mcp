@@ -12,6 +12,7 @@ mod server;
 mod test_support;
 mod tmux;
 mod types;
+mod schema_format;
 
 use std::path::PathBuf;
 

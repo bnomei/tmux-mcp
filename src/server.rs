@@ -328,6 +328,7 @@ pub struct CapturePaneInput {
     #[serde(rename = "paneId")]
     pub pane_id: String,
     /// History line budget when start/end are omitted.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub lines: Option<u32>,
     /// Keep SGR/escape sequences when true.
     pub colors: Option<bool>,
@@ -371,6 +372,7 @@ pub struct SplitPaneInput {
     /// `"horizontal"` or `"vertical"` (default vertical).
     pub direction: Option<String>,
     /// New-pane size percent for tmux 3.x `-l N%`.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub size: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -396,9 +398,11 @@ pub struct ExecuteCommandInput {
     pub no_enter: Option<bool>,
     /// Per-character send delay in milliseconds (slow typing).
     #[serde(rename = "delayMs")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub delay_ms: Option<u64>,
     /// Optional block until terminal or timeout after accept. Prefer resource subscribe.
     #[serde(rename = "waitMs")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub wait_ms: Option<u64>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -412,6 +416,7 @@ pub struct GetCommandResultInput {
     pub command_id: String,
     /// Block until terminal or timeout; timeout does not change command status.
     #[serde(rename = "waitMs")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub wait_ms: Option<u64>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -452,6 +457,7 @@ pub struct MoveWindowInput {
     pub target_session_id: String,
     /// Optional index in the destination session.
     #[serde(rename = "targetIndex")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub target_index: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -478,10 +484,13 @@ pub struct ResizePaneInput {
     /// Relative resize direction: `left`, `right`, `up`, or `down`.
     pub direction: Option<String>,
     /// Cells to grow/shrink when `direction` is set.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub amount: Option<u32>,
     /// Absolute width in cells (overrides relative resize when set with height).
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub width: Option<u32>,
     /// Absolute height in cells.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub height: Option<u32>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -566,9 +575,11 @@ pub struct ShowBufferInput {
     pub name: Option<String>,
     /// Absolute UTF-8 byte offset into the buffer.
     #[serde(rename = "offsetBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub offset_bytes: Option<u64>,
     /// Maximum UTF-8 bytes to return from the offset.
     #[serde(rename = "maxBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub max_bytes: Option<u64>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -643,9 +654,11 @@ pub struct RenameBufferInput {
 pub struct SearchAnchorInput {
     /// Absolute UTF-8 byte offset of the prior match start.
     #[serde(rename = "offsetBytes", alias = "offset_bytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub offset_bytes: u64,
     /// Prior match length in UTF-8 bytes.
     #[serde(rename = "matchLen", alias = "match_len")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub match_len: u32,
     /// Buffer name when the top-level `buffer` field is omitted.
     pub buffer: Option<String>,
@@ -665,12 +678,15 @@ pub struct SearchBufferInput {
     pub mode: SearchMode,
     /// Snippet context radius in bytes around each hit.
     #[serde(rename = "contextBytes")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub context_bytes: Option<u32>,
     /// Hard cap on matches returned for the whole request.
     #[serde(rename = "maxMatches")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub max_matches: Option<u32>,
     /// Per-buffer scan budget for literal starts; regex/fuzzy need full-buffer coverage.
     #[serde(rename = "maxScanBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub max_scan_bytes: Option<u64>,
     /// Attach similarity scores when the fuzzy feature stack is enabled.
     #[serde(rename = "includeSimilarity")]
@@ -683,6 +699,7 @@ pub struct SearchBufferInput {
     pub similarity_threshold: Option<f32>,
     /// Per-buffer absolute byte cursors from a prior truncated result.
     #[serde(rename = "resumeFromOffset")]
+    #[schemars(schema_with = "crate::schema_format::u64_map_schema")]
     pub resume_from_offset: Option<BTreeMap<String, u64>>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
@@ -697,9 +714,11 @@ pub struct SubsearchBufferInput {
     pub anchor: SearchAnchorInput,
     /// Half-window of context around the anchor used as the scan range.
     #[serde(rename = "contextBytes", alias = "context_bytes")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub context_bytes: u32,
     /// Resume cursor within the anchor window for paged subsearch.
     #[serde(rename = "resumeFromOffset")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub resume_from_offset: Option<u64>,
     /// Search query (literal text or regex depending on `mode`).
     pub query: String,
@@ -707,6 +726,7 @@ pub struct SubsearchBufferInput {
     pub mode: SearchMode,
     /// Hard cap on matches returned.
     #[serde(rename = "maxMatches")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub max_matches: Option<u32>,
     /// Attach similarity scores when the fuzzy feature stack is enabled.
     #[serde(rename = "includeSimilarity")]
@@ -735,9 +755,11 @@ pub struct SendKeysInput {
     /// Press Enter after each repeat.
     pub enter: Option<bool>,
     /// How many times to emit `keys` (default 1).
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub repeat: Option<u32>,
     /// Delay between key transmissions in milliseconds.
     #[serde(rename = "delayMs")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub delay_ms: Option<u64>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
