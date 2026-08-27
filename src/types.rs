@@ -20,6 +20,7 @@ pub struct Session {
     /// True when at least one client is attached.
     pub attached: bool,
     /// Window count currently owned by the session.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub windows: u32,
 }
 
@@ -66,9 +67,12 @@ pub struct PaneInfo {
     pub current_path: String,
     /// Foreground command binary name/path; used to pick marker shell dialect.
     pub current_command: String,
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub width: u32,
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub height: u32,
     /// Pane process pid when tmux reports one.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub pid: Option<u32>,
     /// True while the pane is in copy-mode or another tmux mode.
     pub in_mode: bool,
@@ -87,8 +91,11 @@ pub struct WindowInfo {
     /// Active layout algorithm string from tmux (`#{window_layout}`).
     pub layout: String,
     /// Pane count in the window.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub panes: u32,
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub width: u32,
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub height: u32,
     /// True when a pane is zoomed to fill the window.
     pub zoomed: bool,
@@ -106,6 +113,7 @@ pub struct ClientInfo {
     /// Session the client is attached to (name, not id).
     pub session_name: String,
     /// Client process pid when reported.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub pid: Option<u32>,
     /// True when the client is currently attached.
     pub attached: bool,
@@ -117,12 +125,15 @@ pub struct BufferInfo {
     /// Buffer name (`bufferN` or a custom name).
     pub name: String,
     /// Byte length capped at `u32::MAX` for compact JSON clients.
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub size: u32,
     /// Full byte length without the `u32` cap; prefer for search/page budgets.
     #[serde(rename = "sizeBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub size_bytes: u64,
     /// Index in the `list-buffers` response (lower is earlier in that listing).
     #[serde(rename = "orderIndex")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub order_index: u32,
     /// Unix epoch seconds from `#{buffer_created}` when present.
     pub created: Option<i64>,
@@ -148,15 +159,19 @@ pub struct BufferSearchMatch {
     pub buffer: String,
     /// Absolute UTF-8 byte offset of the match start inside the buffer.
     #[serde(rename = "offsetBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub offset_bytes: u64,
     /// Match span length in UTF-8 bytes.
     #[serde(rename = "matchLen")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub match_len: u32,
     /// Inclusive start of the context window in absolute buffer bytes.
     #[serde(rename = "contextStart")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub context_start: u64,
     /// Exclusive end of the context window in absolute buffer bytes.
     #[serde(rename = "contextEnd")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub context_end: u64,
     /// Context text covering `[context_start, context_end)`.
     pub snippet: String,
@@ -176,9 +191,11 @@ pub struct BufferSearchOutput {
     pub mode: SearchMode,
     /// Context radius in bytes applied to each snippet.
     #[serde(rename = "contextBytes")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub context_bytes: u32,
     /// Match cap that bound this result set.
     #[serde(rename = "maxMatches")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub max_matches: u32,
     /// Whether similarity scores were requested.
     #[serde(rename = "includeSimilarity")]
@@ -193,18 +210,22 @@ pub struct BufferSearchOutput {
     pub buffers: Vec<String>,
     /// Number of hits returned in `matches` (not a global total beyond the cap).
     #[serde(rename = "totalMatches")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub total_matches: u32,
     /// How many buffers were opened for this request.
     #[serde(rename = "buffersScanned")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub buffers_scanned: u32,
     /// Aggregate bytes examined across all buffers.
     #[serde(rename = "bytesScannedTotal")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub bytes_scanned_total: u64,
     /// Buffers that stopped early due to scan or match budgets.
     #[serde(rename = "truncatedBuffers")]
     pub truncated_buffers: Vec<String>,
     /// Per-buffer absolute byte cursors for the next page.
     #[serde(rename = "resumeFromOffset")]
+    #[schemars(schema_with = "crate::schema_format::u64_map_schema")]
     pub resume_from_offset: BTreeMap<String, u64>,
     pub matches: Vec<BufferSearchMatch>,
     /// Highest similarity among scored hits when similarity was enabled.
@@ -215,9 +236,11 @@ pub struct BufferSearchOutput {
     pub avg_similarity: Option<f32>,
     /// Lines skipped by fuzzy scoring because they exceeded the line-byte cap.
     #[serde(rename = "fuzzySkippedLines")]
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub fuzzy_skipped_lines: u32,
     /// Total bytes in lines skipped by the fuzzy line-byte cap.
     #[serde(rename = "fuzzySkippedBytes")]
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub fuzzy_skipped_bytes: u64,
 }
 
@@ -330,6 +353,7 @@ pub struct CommandSnapshot {
     /// This describes capture completeness, not whether the command lifecycle is terminal.
     pub output_truncated: bool,
     /// Wall time from accept to completion (or now if still running).
+    #[schemars(schema_with = "crate::schema_format::u64_schema")]
     pub elapsed_ms: u64,
     /// Explanation for cancelled / tracking_error terminals.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -338,6 +362,7 @@ pub struct CommandSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait_timed_out: Option<bool>,
     /// Wire schema version (currently [`CommandSnapshot::SCHEMA_VERSION`]).
+    #[schemars(schema_with = "crate::schema_format::u32_schema")]
     pub schema_version: u32,
 }
 

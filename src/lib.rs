@@ -15,5 +15,7 @@ pub mod tmux;
 /// Shared session/window/pane/buffer/search DTOs used by tools and resources.
 pub mod types;
 
+pub mod schema_format;
+
 #[cfg(test)]
 mod test_support;
