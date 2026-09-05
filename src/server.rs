@@ -115,6 +115,7 @@ use crate::types::{
     command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
     CommandStatus, Pane, SearchMode, Session, Window,
 };
+use crate::watch::{self, WatchConfig};
 
 /// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
 ///
@@ -126,6 +127,8 @@ pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
+    /// Poll/timeout/debounce budgets for `wait-for-pane-change`.
+    watch: WatchConfig,
     router: ToolRouter<Self>,
     /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
@@ -339,6 +342,42 @@ pub struct CapturePaneInput {
     pub join: Option<bool>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
+}
+
+/// `wait-for-pane-change`: block until the pane's displayed text differs.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitForPaneChangeInput {
+    /// Pane target id (`%N`), mirroring `capture-pane` targeting.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Blocking budget in milliseconds; timeout is a successful `timedOut` result.
+    /// Clamped to the `[watch]` `timeout_max_ms` ceiling.
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
+    /// Debounce window in milliseconds: keep resetting while the screen keeps
+    /// changing, wake once it has been stable this long. `0` wakes at the first
+    /// change. Defaults to `[watch]` `stable_ms` (250).
+    #[serde(rename = "stableMs")]
+    pub stable_ms: Option<u64>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `wait-for-pane-change` result: signal only, no pane content.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitForPaneChangeOutput {
+    /// Watched pane target id.
+    pub pane_id: String,
+    /// True when the displayed text differed from the baseline.
+    pub changed: bool,
+    /// True when the blocking budget elapsed without a settled change.
+    /// A timeout is not an error: the pane simply stayed quiet.
+    pub timed_out: bool,
+    /// Milliseconds spent blocking before the wake or timeout.
+    pub waited_ms: u64,
+    /// Milliseconds the screen was stable when the engine woke.
+    pub quiet_ms: u64,
 }
 
 /// `create-session`: detached session bootstrap.
@@ -796,17 +835,31 @@ fn hash_path_for_socket(path: &str) -> String {
 
 #[tool_router]
 impl TmuxMcpServer {
-    /// Build a server with default search streaming thresholds.
+    /// Build a server with default search and watch budgets.
+    ///
+    /// Convenience wrapper for tests and simple embedders; the binary and
+    /// config-aware callers use [`Self::new_with_search_and_watch`].
     #[allow(dead_code)]
     pub fn new(tracker: CommandTracker, policy: SecurityPolicy) -> Self {
-        Self::new_with_search(tracker, policy, SearchConfig::default())
+        Self::new_with_search_and_watch(
+            tracker,
+            policy,
+            SearchConfig::default(),
+            WatchConfig::default(),
+        )
     }
 
-    /// Build a server, merge feature-gated tool routers, and drop routes denied by policy.
-    pub fn new_with_search(
+    /// Build a server with explicit search and watch budgets.
+    ///
+    /// The single real constructor: merges feature-gated tool routers,
+    /// drops routes denied by policy, and spawns the command-event fan-out.
+    /// The `[search]`/`[watch]` sections of config.toml map to their
+    /// respective parameters.
+    pub fn new_with_search_and_watch(
         tracker: CommandTracker,
         policy: SecurityPolicy,
         search: SearchConfig,
+        watch: WatchConfig,
     ) -> Self {
         #[allow(unused_mut)]
         let mut router = Self::tool_router();
@@ -870,6 +923,7 @@ impl TmuxMcpServer {
             tracker,
             policy: Arc::new(policy),
             search,
+            watch,
             router,
             peer,
             subscriptions,
@@ -1390,6 +1444,62 @@ impl TmuxMcpServer {
             )])),
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error capturing pane: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "wait-for-pane-change",
+        description = "Block until the pane's displayed text changes (byte-exact visible-screen comparison), then return so the caller can capture-pane on its decision. One tool call replaces poll loops when driving ssh sessions, containers, or REPLs. Timeout is a success with `timedOut: true`, not an error. Returns no pane content. Targeting mirrors capture-pane (paneId). Any tmux error aborts the wait: a pane that disappeared errors with that message. `timeoutMs` values above the `[watch]` `timeout_max_ms` ceiling are rejected with an error.",
+        annotations(read_only_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<WaitForPaneChangeOutput>()
+    )]
+    async fn wait_for_pane_change(
+        &self,
+        input: Parameters<WaitForPaneChangeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("wait-for-pane-change") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Access denied: {e}"
+            ))]));
+        }
+
+        let params =
+            match watch::WaitParams::resolve(input.0.timeout_ms, input.0.stable_ms, &self.watch) {
+                Ok(params) => params,
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Invalid wait parameters: {e}"
+                    ))]))
+                }
+            };
+        let mut source = watch::TmuxPollSource::new(input.0.pane_id.clone(), socket.clone());
+        match watch::wait_for_change(&mut source, &params).await {
+            Ok(result) => {
+                let output = WaitForPaneChangeOutput {
+                    pane_id: input.0.pane_id.clone(),
+                    changed: result.outcome == watch::WaitOutcome::Changed,
+                    timed_out: result.outcome == watch::WaitOutcome::TimedOut,
+                    waited_ms: result.waited.as_millis() as u64,
+                    quiet_ms: result.quiet.as_millis() as u64,
+                };
+                Ok(structured_output(&output))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error waiting for pane change: {e}"
             ))])),
         }
     }
@@ -5288,6 +5398,120 @@ mod tests {
             .expect("capture pane");
         assert_eq!(result.is_error, Some(true));
         assert!(first_text(&result).contains("Error capturing pane"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_tool_denied_by_policy() {
+        let server = server_with_policy("[security]\nallow_capture = false\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(50),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("wait-for-pane-change"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_pane_gone_errors() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "capture-pane");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "can't find pane: %1");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(2_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("can't find pane"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_timeout_is_success() {
+        // Static stub screen: the wait times out successfully with no wake.
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "static screen");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(80),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(false));
+        let payload: WaitForPaneChangeOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        assert!(!payload.changed);
+        assert!(payload.timed_out);
+        assert!(payload.waited_ms >= 70);
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_wakes_on_screen_change() {
+        // The stub flips its capture output after the first poll.
+        let mut stub = TmuxStub::new();
+        let count_dir = tempfile::TempDir::new().expect("count dir");
+        let count_file = count_dir
+            .path()
+            .join("wait-count")
+            .to_string_lossy()
+            .to_string();
+        stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", &count_file);
+        stub.set_var("TMUX_STUB_CAPTURE_BEFORE", "before");
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER", "2");
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER_OUTPUT", "after");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(5_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(false));
+        let payload: WaitForPaneChangeOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        assert!(payload.changed);
+        assert!(!payload.timed_out);
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_rejects_over_ceiling_timeout() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(10_000_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        let text = first_text(&result);
+        assert!(
+            text.contains("exceeds the configured maximum"),
+            "got: {text}"
+        );
+        assert!(text.contains("600000 ms"));
     }
 
     #[tokio::test]

@@ -216,6 +216,276 @@ async fn test_full_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_wait_for_pane_change_wakes_on_output() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-change");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = panes[0].id.clone();
+
+    // Quiet prompt first: let the shell settle so the baseline is stable.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Change the screen after a short delay.
+    let send_socket = socket.to_string();
+    let send_pane = pane_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tmux::send_keys(
+            &send_pane,
+            "echo wait-marker-$((41+1))",
+            false,
+            Some(&send_socket),
+        )
+        .await;
+        let _ = tmux::send_keys(&send_pane, "Enter", false, Some(&send_socket)).await;
+    });
+
+    let config = watch::WatchConfig::default();
+    let params =
+        watch::WaitParams::resolve(Some(10_000), Some(0), &config).expect("resolve wait params");
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params)
+        .await
+        .expect("wait should not error");
+    assert_eq!(result.outcome, WaitOutcome::Changed);
+    assert!(result.waited >= Duration::from_millis(250));
+
+    // The follow-up capture must show the change the wait woke on.
+    let content =
+        wait_for_pane_output(&pane_id, "wait-marker-42", Duration::from_secs(5), socket).await;
+    assert!(content.contains("wait-marker-42"));
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_times_out_on_quiet_pane() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-timeout");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = panes[0].id.clone();
+
+    // Quiet prompt: no change within the (short) budget.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let config = watch::WatchConfig::default();
+    let params =
+        watch::WaitParams::resolve(Some(1_000), Some(0), &config).expect("resolve wait params");
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params)
+        .await
+        .expect("wait should not error");
+    assert_eq!(result.outcome, WaitOutcome::TimedOut);
+    assert!(result.waited >= Duration::from_millis(900));
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_sibling_pane_does_not_wake() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-sibling");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let watched = panes[0].id.clone();
+
+    let sibling = tmux::split_pane(&watched, Some("horizontal"), Some(50), socket_opt)
+        .await
+        .expect("split pane");
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Change only the sibling pane while the watched pane stays quiet.
+    let send_socket = socket.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tmux::send_keys(&sibling.id, "echo sibling-noise", false, Some(&send_socket)).await;
+        let _ = tmux::send_keys(&sibling.id, "Enter", false, Some(&send_socket)).await;
+    });
+
+    let config = watch::WatchConfig::default();
+    let params =
+        watch::WaitParams::resolve(Some(2_500), Some(0), &config).expect("resolve wait params");
+    let mut source = watch::TmuxPollSource::new(&watched, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params).await;
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => panic!("wait errored: {e}"),
+    };
+    assert_eq!(
+        result.outcome,
+        WaitOutcome::TimedOut,
+        "sibling-pane changes must not wake the watched pane"
+    );
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_pane_gone_errors() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-gone");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch;
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let watched = panes[0].id.clone();
+
+    let extra = tmux::split_pane(&watched, Some("horizontal"), Some(50), socket_opt)
+        .await
+        .expect("split pane");
+
+    // Kill the watched pane while a wait is in flight.
+    let kill_socket = socket.to_string();
+    let kill_pane = watched.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _ = tmux::kill_pane(&kill_pane, Some(&kill_socket)).await;
+    });
+    let _ = &extra;
+
+    let config = watch::WatchConfig::default();
+    let params =
+        watch::WaitParams::resolve(Some(10_000), Some(0), &config).expect("resolve wait params");
+    let mut source = watch::TmuxPollSource::new(&watched, socket_opt.map(str::to_string));
+    let err = watch::wait_for_change(&mut source, &params)
+        .await
+        .expect_err("a killed pane must abort the wait with an error");
+    assert!(err.to_string().contains("pane"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_debounce_settles() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-debounce");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = panes[0].id.clone();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Stream a burst: ~8 lines at 100 ms intervals, then quiet.
+    let send_socket = socket.to_string();
+    let send_pane = pane_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tmux::send_keys(
+            &send_pane,
+            "for i in $(seq 1 8); do echo burst-$i; sleep 0.1; done",
+            false,
+            Some(&send_socket),
+        )
+        .await;
+        let _ = tmux::send_keys(&send_pane, "Enter", false, Some(&send_socket)).await;
+    });
+
+    // Default stable_ms (250): the wait wakes once the burst settles, not
+    // mid-stream.
+    let config = watch::WatchConfig::default();
+    let params =
+        watch::WaitParams::resolve(Some(15_000), None, &config).expect("resolve wait params");
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params)
+        .await
+        .expect("wait should not error");
+    assert_eq!(result.outcome, WaitOutcome::Changed);
+    assert!(
+        result.quiet >= Duration::from_millis(200),
+        "wake happened after the screen settled, quiet was {:?}",
+        result.quiet
+    );
+}
+
+#[tokio::test]
 async fn test_leading_dash_names_are_not_parsed_as_flags() {
     if !should_run_integration_tests() {
         return;

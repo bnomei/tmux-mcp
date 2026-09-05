@@ -14,6 +14,8 @@ pub mod security;
 pub mod tmux;
 /// Shared session/window/pane/buffer/search DTOs used by tools and resources.
 pub mod types;
+/// Blocking "wait until pane text changes" engine for `wait-for-pane-change`.
+pub mod watch;
 
 #[cfg(test)]
 mod test_support;

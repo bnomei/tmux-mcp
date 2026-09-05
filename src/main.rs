@@ -12,6 +12,7 @@ mod server;
 mod test_support;
 mod tmux;
 mod types;
+mod watch;
 
 use std::path::PathBuf;
 
@@ -23,6 +24,7 @@ use crate::commands::{CommandTracker, TrackingConfig};
 use crate::security::{ConfigFile, SearchConfig, SecurityPolicy};
 use crate::server::TmuxMcpServer;
 use crate::types::ShellType;
+use crate::watch::WatchConfig;
 
 /// Process CLI: shell dialect, config path, and socket/SSH isolation overrides.
 #[derive(Parser, Debug)]
@@ -105,55 +107,63 @@ async fn main() {
 
     init_tracing();
 
-    let (security_policy, config_shell_type, config_ssh, tracking_config, search_config) =
-        match &cli.config {
-            Some(path) => {
-                let content = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error reading config file: {e}");
-                        std::process::exit(1);
-                    }
-                };
+    let (
+        security_policy,
+        config_shell_type,
+        config_ssh,
+        tracking_config,
+        search_config,
+        watch_config,
+    ) = match &cli.config {
+        Some(path) => {
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error reading config file: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-                let config_file: ConfigFile = match toml::from_str(&content) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        eprintln!("Error parsing config file: {e}");
-                        std::process::exit(1);
-                    }
-                };
+            let config_file: ConfigFile = match toml::from_str(&content) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("Error parsing config file: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-                let policy = match SecurityPolicy::load(path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Error loading security policy: {e}");
-                        std::process::exit(1);
-                    }
-                };
+            let policy = match SecurityPolicy::load(path) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Error loading security policy: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-                (
-                    policy,
-                    config_file.shell.shell_type,
-                    config_file.ssh.remote,
-                    config_file.tracking,
-                    config_file.search,
-                )
-            }
-            None => (
-                match SecurityPolicy::default_with_env() {
-                    Ok(policy) => policy,
-                    Err(e) => {
-                        eprintln!("Error loading security policy: {e}");
-                        std::process::exit(1);
-                    }
-                },
-                None,
-                None,
-                TrackingConfig::default(),
-                SearchConfig::default(),
-            ),
-        };
+            (
+                policy,
+                config_file.shell.shell_type,
+                config_file.ssh.remote,
+                config_file.tracking,
+                config_file.search,
+                config_file.watch,
+            )
+        }
+        None => (
+            match SecurityPolicy::default_with_env() {
+                Ok(policy) => policy,
+                Err(e) => {
+                    eprintln!("Error loading security policy: {e}");
+                    std::process::exit(1);
+                }
+            },
+            None,
+            None,
+            TrackingConfig::default(),
+            SearchConfig::default(),
+            WatchConfig::default(),
+        ),
+    };
 
     let shell_type_source = config_shell_type.as_deref().unwrap_or(&cli.shell_type);
     let shell_type = match parse_shell_type(shell_type_source) {
@@ -192,7 +202,12 @@ async fn main() {
     } else {
         CommandTracker::new(shell_type)
     };
-    let server = TmuxMcpServer::new_with_search(tracker, security_policy, search_config);
+    let server = TmuxMcpServer::new_with_search_and_watch(
+        tracker,
+        security_policy,
+        search_config,
+        watch_config,
+    );
 
     tracing::info!("Starting tmux-mcp-rs server with stdio transport");
 
