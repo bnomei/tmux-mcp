@@ -115,7 +115,7 @@ use crate::types::{
     command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
     CommandStatus, Pane, SearchMode, Session, Window,
 };
-use crate::watch::{self, WatchConfig};
+use crate::watch::{self, AnchorRegistry, WatchConfig};
 
 /// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
 ///
@@ -129,6 +129,8 @@ pub struct TmuxMcpServer {
     search: SearchConfig,
     /// Poll/timeout/debounce budgets for `wait-for-pane-change`.
     watch: WatchConfig,
+    /// Last-seen pane text per `(socket, pane_id)` — the anchor baseline pool.
+    anchors: Arc<tokio::sync::Mutex<AnchorRegistry>>,
     router: ToolRouter<Self>,
     /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
@@ -924,6 +926,7 @@ impl TmuxMcpServer {
             policy: Arc::new(policy),
             search,
             watch,
+            anchors: Arc::new(tokio::sync::Mutex::new(AnchorRegistry::new())),
             router,
             peer,
             subscriptions,
@@ -933,6 +936,23 @@ impl TmuxMcpServer {
     async fn capture_peer(&self, context: &RequestContext<RoleServer>) {
         let mut slot = self.peer.write().await;
         *slot = Some(context.peer.clone());
+    }
+
+    /// Capture the pane's current visible text as its interaction anchor.
+    ///
+    /// Called by every content-touching tool: input tools before delivering
+    /// (so the anchor is pre-output), reads after. Failures are logged and
+    /// ignored — a failed anchor capture must never break the tool call
+    /// itself; the wait falls back to the current-screen baseline.
+    async fn capture_anchor(&self, pane_id: &str, socket: Option<&str>) {
+        match tmux::capture_pane(pane_id, None, false, None, None, true, socket).await {
+            Ok(text) => {
+                self.anchors.lock().await.set(pane_id, socket, text);
+            }
+            Err(e) => {
+                tracing::debug!("anchor capture failed for {pane_id}: {e}");
+            }
+        }
     }
 
     /// Drop routes that fail capability flags or the tool filter so clients never
@@ -1435,13 +1455,19 @@ impl TmuxMcpServer {
         )
         .await
         {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(
-                if content.is_empty() {
-                    "No content captured".into()
-                } else {
-                    content
-                },
-            )])),
+            Ok(content) => {
+                // Read anchor: the agent has now seen this text — a following
+                // wait arms from here (no double-report of old changes).
+                self.capture_anchor(&input.0.pane_id, socket.as_deref())
+                    .await;
+                Ok(CallToolResult::success(vec![Content::text(
+                    if content.is_empty() {
+                        "No content captured".into()
+                    } else {
+                        content
+                    },
+                )]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error capturing pane: {e}"
             ))])),
@@ -1450,7 +1476,7 @@ impl TmuxMcpServer {
 
     #[tool(
         name = "wait-for-pane-change",
-        description = "Block until the pane's displayed text changes (byte-exact visible-screen comparison), then return so the caller can capture-pane on its decision. One tool call replaces poll loops when driving ssh sessions, containers, or REPLs. Timeout is a success with `timedOut: true`, not an error. Returns no pane content. Targeting mirrors capture-pane (paneId). Any tmux error aborts the wait: a pane that disappeared errors with that message. `timeoutMs` values above the `[watch]` `timeout_max_ms` ceiling are rejected with an error.",
+        description = "Block until the pane's displayed text changes since your last interaction with it (input like send-keys, or any read of the pane), then return so the caller can capture-pane on its own decision. The wake predicate is byte-exact visible-screen comparison; commands that finish before you call this tool still wake it immediately. One tool call replaces poll loops when driving ssh sessions, containers, or REPLs. Timeout is a success with `timedOut: true`, not an error. Returns no pane content. Targeting mirrors capture-pane (paneId). Any tmux error aborts the wait: a pane that disappeared errors with that message. `timeoutMs` values above the `[watch]` `timeout_max_ms` ceiling are rejected with an error.",
         annotations(read_only_hint = true),
         output_schema = rmcp::handler::server::common::schema_for_type::<WaitForPaneChangeOutput>()
     )]
@@ -1486,9 +1512,26 @@ impl TmuxMcpServer {
                     ))]))
                 }
             };
+        // Arm against the interaction anchor (pre-input baseline), falling
+        // back to the current screen when no anchor exists. This closes the
+        // fast-command race: output that landed between the agent's last
+        // input/read and this call still wakes the wait.
+        let anchor = self
+            .anchors
+            .lock()
+            .await
+            .get(&input.0.pane_id, socket.as_deref())
+            .map(|snap| snap.text);
         let mut source = watch::TmuxPollSource::new(input.0.pane_id.clone(), socket.clone());
-        match watch::wait_for_change(&mut source, &params).await {
+        match watch::wait_for_change(&mut source, &params, anchor).await {
             Ok(result) => {
+                // Re-anchor at the current screen on every wake (changed or
+                // timed out): repeated waits arm from what the caller just
+                // observed, never re-reporting an already-reported change.
+                // `current.text` is not exposed by `WaitResult`, so recapture
+                // — the wait just proved the pane readable.
+                self.capture_anchor(&input.0.pane_id, socket.as_deref())
+                    .await;
                 let output = WaitForPaneChangeOutput {
                     pane_id: input.0.pane_id.clone(),
                     changed: result.outcome == watch::WaitOutcome::Changed,
@@ -2048,7 +2091,14 @@ impl TmuxMcpServer {
         )
         .await
         {
-            Ok(pane) => Ok(structured_output(&pane)),
+            Ok(pane) => {
+                // Anchor the newborn pane at its birth screen so a following
+                // wait-for-pane-change (e.g. "wait for the first prompt")
+                // wakes when the shell draws — the pane-birth flavor of the
+                // fast-command race.
+                self.capture_anchor(&pane.id, socket.as_deref()).await;
+                Ok(structured_output(&pane))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error splitting pane: {e}"
             ))])),
@@ -2154,6 +2204,10 @@ impl TmuxMcpServer {
                 self.tracker
                     .purge_pane(&input.0.pane_id, socket.as_deref())
                     .await;
+                self.anchors
+                    .lock()
+                    .await
+                    .purge_pane(&input.0.pane_id, socket.as_deref());
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Pane {} has been killed",
                     input.0.pane_id
@@ -2200,6 +2254,10 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.command) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: tracked wrapper is input — arm before it lands so a
+        // follow-up wait-for-pane-change catches fast completed commands.
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match self
             .tracker
             .execute_command(
@@ -2971,6 +3029,11 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.keys) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: capture the pre-input screen once per call (the
+        // repeat loop below is one key sequence) so a following
+        // wait-for-pane-change arms against what the agent last saw.
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         let repeat_count = input.0.repeat.unwrap_or(1).max(1);
         for _ in 0..repeat_count {
             if let Some(delay) = input.0.delay_ms {
@@ -3068,6 +3131,9 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: arm before the bytes land (see `send-keys`).
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match tmux::send_keys_hex(&input.0.pane_id, &input.0.hex, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Hex bytes sent to pane {}",
@@ -3107,6 +3173,9 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: arm before the paste lands (see `send-keys`).
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match tmux::paste_text(&input.0.pane_id, &input.0.content, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Pasted text into pane {}",
@@ -3368,6 +3437,8 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor for every special-key tool: arm before the key lands.
+        self.capture_anchor(pane_id, socket.as_deref()).await;
         match tmux::send_keys(pane_id, key, false, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "{key} sent to pane {pane_id}"
@@ -3823,9 +3894,13 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 )
                 .await
                 {
-                    Ok(content) => Ok(read_resource_result! {
-                        contents: vec![ResourceContents::text(content, uri)],
-                    }),
+                    Ok(content) => {
+                        // Read anchor: the caller has seen this text.
+                        self.capture_anchor(pane_id, socket.as_deref()).await;
+                        Ok(read_resource_result! {
+                            contents: vec![ResourceContents::text(content, uri)],
+                        })
+                    }
                     Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
@@ -3855,9 +3930,13 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(read_resource_result! {
-                                contents: vec![ResourceContents::text(content, uri)],
-                            }),
+                            Ok(content) => {
+                                // Read anchor: the caller has seen this text.
+                                self.capture_anchor(pane_id, socket.as_deref()).await;
+                                Ok(read_resource_result! {
+                                    contents: vec![ResourceContents::text(content, uri)],
+                                })
+                            }
                             Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),
@@ -3885,9 +3964,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(read_resource_result! {
-                                contents: vec![ResourceContents::text(content, uri)],
-                            }),
+                            Ok(content) => {
+                                // Read anchor: the caller has seen this text
+                                // (ANSI variant included).
+                                self.capture_anchor(pane_id, socket.as_deref()).await;
+                                Ok(read_resource_result! {
+                                    contents: vec![ResourceContents::text(content, uri)],
+                                })
+                            }
                             Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),

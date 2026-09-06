@@ -502,6 +502,7 @@ Prefer `execute-command` with resource subscribe/read (or `get-command-result` +
 `wait-for-pane-change` blocks server-side until the pane's displayed text changes, then returns so the caller can `capture-pane` on its own decision. Use it instead of poll loops when the interesting process is *nested*—ssh sessions, containers, REPLs, editors, test watchers—because the side-channel tracker that powers `execute-command` only sees the pane's shell, not the program inside it.
 
 - The wake predicate is byte-exact visible-screen comparison, mirroring `capture-pane` targeting (`paneId`, same scope). No content is returned; capture afterwards to see what changed.
+- **The baseline is your last interaction with the pane** — the text shown when you last sent input (`send-keys`, `paste-text`, `execute-command`) or read it (`capture-pane`, pane resources). Commands that finish *before* you call the wait still wake it immediately, so there is no need to guess whether a command was fast: send, wait, capture. Each wake re-anchors, so repeated waits on a streaming program report each new change once and never re-report an old one. Metadata tools (`list-panes`, zoom, resize, …) do not anchor: they display no pane text.
 - Timeout is a **success** result with `timedOut: true`—a quiet pane is not an error.
 - Any tmux error aborts the wait: a pane that disappeared returns an error stating the pane is gone.
 - `timeoutMs` values above `[watch]` `timeout_max_ms` (default 600 s) are rejected with an error naming the ceiling.
@@ -511,7 +512,7 @@ Prefer `execute-command` with resource subscribe/read (or `get-command-result` +
 Typical flow when driving an ssh session:
 
 1. `send-keys` the remote command into the pane.
-2. `wait-for-pane-change` on that pane with a `timeoutMs` that covers the expected runtime.
+2. `wait-for-pane-change` on that pane with a `timeoutMs` that covers the expected runtime. The wait arms at the screen *before your input*, so a command that already finished wakes it immediately; a slow one blocks as usual.
 3. On wake (or timeout), `capture-pane` to read the result.
 
 One tool call replaces every iteration of "capture, inspect, decide, sleep" in that loop.

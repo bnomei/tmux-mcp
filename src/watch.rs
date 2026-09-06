@@ -8,6 +8,7 @@
 //! (including a pane that disappeared) aborts the wait immediately; timeouts
 //! are successful results.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
@@ -74,6 +75,97 @@ fn default_poll_interval_ms() -> u64 {
         DEFAULT_SSH_POLL_INTERVAL_MS
     } else {
         DEFAULT_POLL_INTERVAL_MS
+    }
+}
+
+/// Fixed LRU cap for the anchor registry. Bounds stale entries from panes
+/// that die without our kill-tools firing (shells exiting, external kills,
+/// tmux server restarts that reset `%N` ids). Hot panes are never evicted in
+/// practice at this size.
+const ANCHOR_REGISTRY_MAX_ENTRIES: usize = 256;
+
+/// Pane-keyed store of the text the agent last had the opportunity to see.
+///
+/// Every input to a pane (`send-keys` family, `paste-text`, `execute-command`)
+/// and every text read (`capture-pane`, text pane resources, every
+/// `wait-for-pane-change` wake) refreshes the anchor. `wait-for-pane-change`
+/// then arms against the anchor — not the screen at call time — which closes
+/// the fast-command race: commands that finish during the LLM round trip
+/// before the wait call wake instantly on the first poll.
+///
+/// The registry is LRU-bounded: purge-on-kill is the primary cleanup, the
+/// cap is the backstop for unobservable pane deaths. FIFO would evict a
+/// long-driven pane merely for being old; LRU keeps exactly the hot entries.
+#[derive(Debug, Default)]
+pub struct AnchorRegistry {
+    entries: HashMap<String, PaneSnapshot>,
+    /// Recency ring: most recently touched key is last.
+    order: Vec<String>,
+}
+
+impl AnchorRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn key(pane_id: &str, socket: Option<&str>) -> String {
+        format!("{}|{}", socket.unwrap_or(""), pane_id)
+    }
+
+    /// Store the anchor for a pane and mark it most recently used.
+    pub fn set(&mut self, pane_id: &str, socket: Option<&str>, text: String) {
+        let key = Self::key(pane_id, socket);
+        if !self.entries.contains_key(&key) {
+            self.order.push(key.clone());
+            if self.order.len() > ANCHOR_REGISTRY_MAX_ENTRIES {
+                // Evict the least recently used entry.
+                if let Some(evicted) = self.order.first().cloned() {
+                    self.order.remove(0);
+                    self.entries.remove(&evicted);
+                }
+            }
+        } else {
+            self.order.retain(|k| k != &key);
+            self.order.push(key.clone());
+        }
+        self.entries.insert(
+            key,
+            PaneSnapshot {
+                pane_id: pane_id.to_string(),
+                text,
+            },
+        );
+    }
+
+    /// Fetch the anchor for a pane, marking it most recently used.
+    pub fn get(&mut self, pane_id: &str, socket: Option<&str>) -> Option<PaneSnapshot> {
+        let key = Self::key(pane_id, socket);
+        let snapshot = self.entries.get(&key).cloned();
+        if snapshot.is_some() {
+            self.order.retain(|k| k != &key);
+            self.order.push(key);
+        }
+        snapshot
+    }
+
+    /// Drop a pane's anchor (purge on kill).
+    pub fn purge_pane(&mut self, pane_id: &str, socket: Option<&str>) {
+        let key = Self::key(pane_id, socket);
+        self.entries.remove(&key);
+        self.order.retain(|k| k != &key);
+    }
+
+    /// Number of stored anchors (for tests).
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// True when no anchors are stored (for Clippy's `is_empty` rule).
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -196,25 +288,44 @@ impl WaitParams {
     }
 }
 
-/// Poll `source` until the visible text differs from the first snapshot.
+/// Poll `source` until the visible text differs from the baseline.
 ///
-/// The baseline is taken immediately (before any sleep), so changes that land
-/// during the wait are what wake the engine. With `stable_ms > 0`, a change
-/// resets a quiet-timer and the engine wakes only once the screen has been
-/// stable for that long; `stable_ms == 0` wakes at the first difference.
-/// Any `source` error aborts immediately — the caller surfaces it as a tool
-/// error (pane-gone included).
+/// The default baseline is `source`'s first snapshot (current screen);
+/// callers pass `anchor` to arm against an earlier interaction instead
+/// (see `AnchorRegistry`) so changes that landed before this call — the
+/// fast-command race — still wake the engine. `quiet` timing is measured
+/// from the last observed change. With `stable_ms > 0`, a change resets a
+/// quiet-timer and the engine wakes only once the screen has been stable for
+/// that long; `stable_ms == 0` wakes at the first difference. Any `source`
+/// error aborts immediately — the caller surfaces it as a tool error
+/// (pane-gone included).
 pub async fn wait_for_change<S: ChangeSource + ?Sized>(
     source: &mut S,
     params: &WaitParams,
+    anchor: Option<String>,
 ) -> Result<WaitResult> {
     let start = Instant::now();
-    let baseline = source.snapshot().await?;
-    let mut current = baseline.clone();
+    let mut current = source.snapshot().await?;
+    let baseline = anchor.unwrap_or_else(|| current.text.clone());
     // Timestamp of the last observed change; the screen was "stable" since
     // the baseline by definition.
     let mut last_change = start;
-    let mut has_changed = false;
+    // An anchor that already differs from the current screen means a change
+    // happened before this call (the fast-command race): report it at the
+    // first poll rather than sleeping through a no-op wait.
+    let mut has_changed = baseline != current.text;
+
+    // Fast path (fast-command race): the anchor already differs from the
+    // current screen, and no debounce is requested — the change happened
+    // before this call and the screen is what the agent would capture now.
+    // Wake immediately instead of sleeping a tick first.
+    if has_changed && params.stable_ms.is_zero() {
+        return Ok(WaitResult {
+            outcome: WaitOutcome::Changed,
+            waited: start.elapsed(),
+            quiet: Duration::ZERO,
+        });
+    }
 
     loop {
         let elapsed = start.elapsed();
@@ -408,7 +519,7 @@ mod tests {
     async fn test_wait_first_change_wakes_with_zero_stable() {
         let mut source = FakeSource::new(vec![snap("a"), snap("b")]);
         let params = fast_params(0, 5_000);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::Changed);
     }
 
@@ -416,7 +527,7 @@ mod tests {
     async fn test_wait_identical_text_does_not_wake() {
         let mut source = FakeSource::new(vec![snap("same"), snap("same"), snap("same")]);
         let params = fast_params(0, 50);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
     }
 
@@ -424,7 +535,7 @@ mod tests {
     async fn test_wait_timeout_reports_quiet_since_start() {
         let mut source = FakeSource::new(vec![snap("same")]);
         let params = fast_params(0, 40);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
         assert!(result.quiet >= Duration::from_millis(30));
     }
@@ -456,7 +567,7 @@ mod tests {
             polls: RefCell::new(0),
         };
         let params = fast_params(60, 200);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(
             result.outcome,
             WaitOutcome::TimedOut,
@@ -469,7 +580,7 @@ mod tests {
         // Burst, then quiet: wake once the quiet window elapses.
         let mut source = FakeSource::new(vec![snap("a"), snap("b"), snap("b"), snap("b")]);
         let params = fast_params(30, 2_000);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::Changed);
         assert!(result.quiet >= params.stable_ms);
     }
@@ -486,7 +597,7 @@ mod tests {
             snap("a"),
         ]);
         let params = fast_params(40, 2_000);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(
             result.outcome,
             WaitOutcome::Changed,
@@ -503,7 +614,7 @@ mod tests {
             }),
         ]);
         let params = fast_params(0, 5_000);
-        let err = wait_for_change(&mut source, &params)
+        let err = wait_for_change(&mut source, &params, None)
             .await
             .expect_err("pane-gone error must propagate");
         match err {
@@ -518,7 +629,7 @@ mod tests {
             message: "no server running".into(),
         })]);
         let params = fast_params(0, 5_000);
-        let err = wait_for_change(&mut source, &params)
+        let err = wait_for_change(&mut source, &params, None)
             .await
             .expect_err("baseline failure must propagate");
         assert_eq!(source.poll_count(), 1, "no polling after baseline error");
@@ -530,7 +641,7 @@ mod tests {
         // Empty is a legitimate screen state: baseline empty -> text must not wake.
         let mut source = FakeSource::new(vec![snap(""), snap(""), snap("")]);
         let params = fast_params(0, 50);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::TimedOut);
     }
 
@@ -539,7 +650,7 @@ mod tests {
         // Non-empty baseline -> empty screen is a change (e.g. `clear`).
         let mut source = FakeSource::new(vec![snap("before"), snap(""), snap("")]);
         let params = fast_params(0, 5_000);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(result.outcome, WaitOutcome::Changed);
     }
 
@@ -547,12 +658,114 @@ mod tests {
     async fn test_wait_whitespace_only_diff_wakes() {
         let mut source = FakeSource::new(vec![snap("line"), snap("line "), snap("line ")]);
         let params = fast_params(0, 5_000);
-        let result = wait_for_change(&mut source, &params).await.unwrap();
+        let result = wait_for_change(&mut source, &params, None).await.unwrap();
         assert_eq!(
             result.outcome,
             WaitOutcome::Changed,
             "byte-exact comparison: a trailing space is a change"
         );
+    }
+
+    #[test]
+    fn test_anchor_registry_set_get_purge() {
+        let mut registry = AnchorRegistry::new();
+        assert!(registry.is_empty());
+        registry.set("%1", None, "first".into());
+        registry.set("%2", Some("/tmp/sock"), "second".into());
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.get("%1", None).unwrap().text, "first");
+        assert_eq!(
+            registry.get("%1", Some("/tmp/sock")),
+            None,
+            "socket keys differ"
+        );
+        assert_eq!(
+            registry.get("%2", Some("/tmp/sock")).unwrap().text,
+            "second"
+        );
+        registry.purge_pane("%1", None);
+        assert_eq!(registry.get("%1", None), None);
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn test_anchor_registry_evicts_least_recently_used() {
+        let mut registry = AnchorRegistry::new();
+        registry.set("%1", None, "a".into());
+        registry.set("%2", None, "b".into());
+        // Touch %1 AFTER %2 exists so %2 becomes the LRU victim when the cap
+        // is exceeded (recency = last touch, and %1's latest touch is newer).
+        registry.set("%1", None, "a2".into());
+        for i in 0..254 {
+            registry.set(&format!("%{}", i + 3), None, format!("v{i}"));
+        }
+        assert_eq!(registry.len(), 256, "cap holds");
+        // Adding one more evicts the least-recently-used entry (%2).
+        registry.set("%999", None, "overflow".into());
+        assert_eq!(registry.len(), 256, "capped after insert");
+        assert_eq!(registry.get("%2", None), None);
+        assert_eq!(registry.get("%999", None).unwrap().text, "overflow");
+        // Hot entry survived.
+        assert_eq!(registry.get("%1", None).unwrap().text, "a2");
+    }
+
+    #[tokio::test]
+    async fn test_wait_anchored_pre_changed_screen_wakes_immediately() {
+        // The fast-command race: anchor is the pre-output screen, the current
+        // screen already contains the output. Zero debounce -> instant wake.
+        let mut source = FakeSource::new(vec![snap("after output")]);
+        let params = fast_params(0, 10_000);
+        let result = wait_for_change(&mut source, &params, Some("before output".into()))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, WaitOutcome::Changed);
+        assert!(
+            result.waited < Duration::from_millis(100),
+            "no poll sleep needed"
+        );
+        assert_eq!(source.poll_count(), 1, "baseline captured, no polling");
+    }
+
+    #[tokio::test]
+    async fn test_wait_anchored_pre_changed_screen_respects_debounce() {
+        // With stable_ms > 0 the pre-changed anchor still needs the quiet
+        // window before waking — the engine cannot assume when the change
+        // settled.
+        let mut source = FakeSource::new(vec![
+            snap("after output"),
+            snap("after output"),
+            snap("after output"),
+        ]);
+        let params = fast_params(30, 5_000);
+        let result = wait_for_change(&mut source, &params, Some("before".into()))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, WaitOutcome::Changed);
+    }
+
+    #[tokio::test]
+    async fn test_wait_anchor_matching_current_text_times_out_normally() {
+        // Anchor equals the current screen: no pre-call change, and the pane
+        // stays quiet — v1 timeout behavior.
+        let mut source = FakeSource::new(vec![snap("same"), snap("same")]);
+        let params = fast_params(0, 60);
+        let result = wait_for_change(&mut source, &params, Some("same".into()))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, WaitOutcome::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_wait_anchor_change_then_revert_wakes() {
+        // Output landed and was replaced (e.g. cleared) between interaction
+        // and wait: the anchor still differs from current, so it wakes —
+        // the caller captures and sees the current state.
+        let mut source = FakeSource::new(vec![snap("")]);
+        let params = fast_params(0, 5_000);
+        let result = wait_for_change(&mut source, &params, Some("old text".into()))
+            .await
+            .unwrap();
+        assert_eq!(result.outcome, WaitOutcome::Changed);
     }
 
     #[tokio::test]
@@ -567,7 +780,7 @@ mod tests {
             tokio::spawn(async move {
                 let mut guard = source.lock().await;
                 let source: &mut FakeSource = &mut guard;
-                let _ = wait_for_change(source, &params).await;
+                let _ = wait_for_change(source, &params, None).await;
             })
         };
         tokio::time::sleep(Duration::from_millis(30)).await;

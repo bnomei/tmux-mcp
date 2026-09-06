@@ -264,7 +264,7 @@ async fn test_wait_for_pane_change_wakes_on_output() {
     let params =
         watch::WaitParams::resolve(Some(10_000), Some(0), &config).expect("resolve wait params");
     let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
-    let result = watch::wait_for_change(&mut source, &params)
+    let result = watch::wait_for_change(&mut source, &params, None)
         .await
         .expect("wait should not error");
     assert_eq!(result.outcome, WaitOutcome::Changed);
@@ -310,7 +310,7 @@ async fn test_wait_for_pane_change_times_out_on_quiet_pane() {
     let params =
         watch::WaitParams::resolve(Some(1_000), Some(0), &config).expect("resolve wait params");
     let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
-    let result = watch::wait_for_change(&mut source, &params)
+    let result = watch::wait_for_change(&mut source, &params, None)
         .await
         .expect("wait should not error");
     assert_eq!(result.outcome, WaitOutcome::TimedOut);
@@ -362,7 +362,7 @@ async fn test_wait_for_pane_change_sibling_pane_does_not_wake() {
     let params =
         watch::WaitParams::resolve(Some(2_500), Some(0), &config).expect("resolve wait params");
     let mut source = watch::TmuxPollSource::new(&watched, socket_opt.map(str::to_string));
-    let result = watch::wait_for_change(&mut source, &params).await;
+    let result = watch::wait_for_change(&mut source, &params, None).await;
     let result = match result {
         Ok(result) => result,
         Err(e) => panic!("wait errored: {e}"),
@@ -418,7 +418,7 @@ async fn test_wait_for_pane_change_pane_gone_errors() {
     let params =
         watch::WaitParams::resolve(Some(10_000), Some(0), &config).expect("resolve wait params");
     let mut source = watch::TmuxPollSource::new(&watched, socket_opt.map(str::to_string));
-    let err = watch::wait_for_change(&mut source, &params)
+    let err = watch::wait_for_change(&mut source, &params, None)
         .await
         .expect_err("a killed pane must abort the wait with an error");
     assert!(err.to_string().contains("pane"), "unexpected error: {err}");
@@ -474,7 +474,7 @@ async fn test_wait_for_pane_change_debounce_settles() {
     let params =
         watch::WaitParams::resolve(Some(15_000), None, &config).expect("resolve wait params");
     let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
-    let result = watch::wait_for_change(&mut source, &params)
+    let result = watch::wait_for_change(&mut source, &params, None)
         .await
         .expect("wait should not error");
     assert_eq!(result.outcome, WaitOutcome::Changed);
@@ -483,6 +483,143 @@ async fn test_wait_for_pane_change_debounce_settles() {
         "wake happened after the screen settled, quiet was {:?}",
         result.quiet
     );
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_anchor_wakes_on_fast_command() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    // The fast-command race: input lands, the command finishes during the
+    // "agent thinks" gap, and only then is the wait called. With the input
+    // anchor, the wait wakes immediately instead of timing out.
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-fast");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = panes[0].id.clone();
+
+    // Let the shell settle; simulate the pre-input anchor by capturing now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let anchor_text = tmux::capture_pane(&pane_id, None, false, None, None, true, socket_opt)
+        .await
+        .expect("anchor capture");
+
+    // Input, then the command completes while the "agent" is thinking.
+    tmux::send_keys(&pane_id, "echo fast-command-done", false, socket_opt)
+        .await
+        .expect("send keys");
+    tmux::send_keys(&pane_id, "Enter", false, socket_opt)
+        .await
+        .expect("send enter");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // Wait armed with the pre-input anchor: wakes immediately.
+    let config = watch::WatchConfig::default();
+    let params = watch::WaitParams::resolve(Some(5_000), Some(0), &config).unwrap();
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params, Some(anchor_text))
+        .await
+        .expect("wait should not error");
+    assert_eq!(result.outcome, WaitOutcome::Changed);
+    assert!(
+        result.waited < Duration::from_millis(1_000),
+        "anchored wake must be immediate, took {:?}",
+        result.waited
+    );
+}
+
+#[tokio::test]
+async fn test_wait_for_pane_change_anchor_repeated_waits_do_not_re_report() {
+    if !should_run_integration_tests() {
+        return;
+    }
+
+    // Simulates the wait-handler's re-anchor loop: each wake refreshes the
+    // baseline to the text it observed, so a second wait on a now-quiet pane
+    // times out instead of re-reporting the first change.
+    let mut fixture = TmuxFixture::new();
+    let session_name = unique_session_name("wait-repeat");
+    fixture.track_session(&session_name);
+
+    use tmux_mcp_rs::tmux;
+    use tmux_mcp_rs::watch::{self, WaitOutcome};
+
+    let socket = fixture.socket();
+    let socket_opt = Some(socket);
+
+    let session = tmux::create_session(&session_name, socket_opt)
+        .await
+        .expect("create session");
+    let windows = tmux::list_windows(&session.id, socket_opt)
+        .await
+        .expect("list windows");
+    let panes = tmux::list_panes(&windows[0].id, socket_opt)
+        .await
+        .expect("list panes");
+    let pane_id = panes[0].id.clone();
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Change the screen once.
+    tmux::send_keys(&pane_id, "echo one-shot", false, socket_opt)
+        .await
+        .expect("send keys");
+    tmux::send_keys(&pane_id, "Enter", false, socket_opt)
+        .await
+        .expect("send enter");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    let config = watch::WatchConfig::default();
+    let params = watch::WaitParams::resolve(Some(2_000), Some(0), &config).unwrap();
+
+    // Wait 1: no anchor -> arms on current screen; still quiet afterwards
+    // (the change predated the call), so it times out... but with the
+    // handler's wake-time re-anchor we simulate the read: capture = anchor.
+    let first_anchor = tmux::capture_pane(&pane_id, None, false, None, None, true, socket_opt)
+        .await
+        .expect("post-change capture (wake re-anchor)");
+
+    // Wait 2 armed at the re-anchored text: pane is quiet -> timeout, NOT a
+    // re-report of the earlier change.
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params, Some(first_anchor.clone()))
+        .await
+        .expect("wait should not error");
+    assert_eq!(
+        result.outcome,
+        WaitOutcome::TimedOut,
+        "a re-anchored wait must not re-report an already-observed change"
+    );
+
+    // Wait 3: new change after the re-anchor wakes.
+    tmux::send_keys(&pane_id, "echo second-change", false, socket_opt)
+        .await
+        .expect("send keys");
+    tmux::send_keys(&pane_id, "Enter", false, socket_opt)
+        .await
+        .expect("send enter");
+    let mut source = watch::TmuxPollSource::new(&pane_id, socket_opt.map(str::to_string));
+    let result = watch::wait_for_change(&mut source, &params, Some(first_anchor))
+        .await
+        .expect("wait should not error");
+    assert_eq!(result.outcome, WaitOutcome::Changed);
 }
 
 #[tokio::test]
