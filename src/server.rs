@@ -115,6 +115,7 @@ use crate::types::{
     command_resource_uri, BufferInfo, BufferSearchOutput, ClientInfo, CommandSnapshot,
     CommandStatus, Pane, SearchMode, Session, Window,
 };
+use crate::watch::{self, AnchorRegistry, WatchConfig};
 
 /// stdio MCP server: policy-gated tool router, command tracker, and dynamic resources.
 ///
@@ -126,6 +127,10 @@ pub struct TmuxMcpServer {
     tracker: Arc<CommandTracker>,
     policy: Arc<SecurityPolicy>,
     search: SearchConfig,
+    /// Poll/timeout/debounce budgets for `wait-for-pane-change`.
+    watch: WatchConfig,
+    /// Last-seen pane text per `(socket, pane_id)` — the anchor baseline pool.
+    anchors: Arc<tokio::sync::Mutex<AnchorRegistry>>,
     router: ToolRouter<Self>,
     /// Connected MCP peer used for resource list/updated notifications.
     peer: Arc<RwLock<Option<Peer<RoleServer>>>>,
@@ -339,6 +344,42 @@ pub struct CapturePaneInput {
     pub join: Option<bool>,
     /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
     pub socket: Option<String>,
+}
+
+/// `wait-for-pane-change`: block until the pane's displayed text differs.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitForPaneChangeInput {
+    /// Pane target id (`%N`), mirroring `capture-pane` targeting.
+    #[serde(rename = "paneId")]
+    pub pane_id: String,
+    /// Blocking budget in milliseconds; timeout is a successful `timedOut` result.
+    /// Clamped to the `[watch]` `timeout_max_ms` ceiling.
+    #[serde(rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
+    /// Debounce window in milliseconds: keep resetting while the screen keeps
+    /// changing, wake once it has been stable this long. `0` wakes at the first
+    /// change. Defaults to `[watch]` `stable_ms` (250).
+    #[serde(rename = "stableMs")]
+    pub stable_ms: Option<u64>,
+    /// Per-call tmux socket path. Prefer a unique per-agent socket for isolation.
+    pub socket: Option<String>,
+}
+
+/// `wait-for-pane-change` result: signal only, no pane content.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitForPaneChangeOutput {
+    /// Watched pane target id.
+    pub pane_id: String,
+    /// True when the displayed text differed from the baseline.
+    pub changed: bool,
+    /// True when the blocking budget elapsed without a settled change.
+    /// A timeout is not an error: the pane simply stayed quiet.
+    pub timed_out: bool,
+    /// Milliseconds spent blocking before the wake or timeout.
+    pub waited_ms: u64,
+    /// Milliseconds the screen was stable when the engine woke.
+    pub quiet_ms: u64,
 }
 
 /// `create-session`: detached session bootstrap.
@@ -796,17 +837,31 @@ fn hash_path_for_socket(path: &str) -> String {
 
 #[tool_router]
 impl TmuxMcpServer {
-    /// Build a server with default search streaming thresholds.
+    /// Build a server with default search and watch budgets.
+    ///
+    /// Convenience wrapper for tests and simple embedders; the binary and
+    /// config-aware callers use [`Self::new_with_search_and_watch`].
     #[allow(dead_code)]
     pub fn new(tracker: CommandTracker, policy: SecurityPolicy) -> Self {
-        Self::new_with_search(tracker, policy, SearchConfig::default())
+        Self::new_with_search_and_watch(
+            tracker,
+            policy,
+            SearchConfig::default(),
+            WatchConfig::default(),
+        )
     }
 
-    /// Build a server, merge feature-gated tool routers, and drop routes denied by policy.
-    pub fn new_with_search(
+    /// Build a server with explicit search and watch budgets.
+    ///
+    /// The single real constructor: merges feature-gated tool routers,
+    /// drops routes denied by policy, and spawns the command-event fan-out.
+    /// The `[search]`/`[watch]` sections of config.toml map to their
+    /// respective parameters.
+    pub fn new_with_search_and_watch(
         tracker: CommandTracker,
         policy: SecurityPolicy,
         search: SearchConfig,
+        watch: WatchConfig,
     ) -> Self {
         #[allow(unused_mut)]
         let mut router = Self::tool_router();
@@ -870,6 +925,8 @@ impl TmuxMcpServer {
             tracker,
             policy: Arc::new(policy),
             search,
+            watch,
+            anchors: Arc::new(tokio::sync::Mutex::new(AnchorRegistry::new())),
             router,
             peer,
             subscriptions,
@@ -879,6 +936,23 @@ impl TmuxMcpServer {
     async fn capture_peer(&self, context: &RequestContext<RoleServer>) {
         let mut slot = self.peer.write().await;
         *slot = Some(context.peer.clone());
+    }
+
+    /// Capture the pane's current visible text as its interaction anchor.
+    ///
+    /// Called by every content-touching tool: input tools before delivering
+    /// (so the anchor is pre-output), reads after. Failures are logged and
+    /// ignored — a failed anchor capture must never break the tool call
+    /// itself; the wait falls back to the current-screen baseline.
+    async fn capture_anchor(&self, pane_id: &str, socket: Option<&str>) {
+        match tmux::capture_pane(pane_id, None, false, None, None, true, socket).await {
+            Ok(text) => {
+                self.anchors.lock().await.set(pane_id, socket, text);
+            }
+            Err(e) => {
+                tracing::debug!("anchor capture failed for {pane_id}: {e}");
+            }
+        }
     }
 
     /// Drop routes that fail capability flags or the tool filter so clients never
@@ -1381,15 +1455,94 @@ impl TmuxMcpServer {
         )
         .await
         {
-            Ok(content) => Ok(CallToolResult::success(vec![Content::text(
-                if content.is_empty() {
-                    "No content captured".into()
-                } else {
-                    content
-                },
-            )])),
+            Ok(content) => {
+                // Read anchor: the agent has now seen this text — a following
+                // wait arms from here (no double-report of old changes).
+                self.capture_anchor(&input.0.pane_id, socket.as_deref())
+                    .await;
+                Ok(CallToolResult::success(vec![Content::text(
+                    if content.is_empty() {
+                        "No content captured".into()
+                    } else {
+                        content
+                    },
+                )]))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error capturing pane: {e}"
+            ))])),
+        }
+    }
+
+    #[tool(
+        name = "wait-for-pane-change",
+        description = "Block until the pane's displayed text changes since your last interaction with it (input like send-keys, or any read of the pane), then return so the caller can capture-pane on its own decision. The wake predicate is byte-exact visible-screen comparison; commands that finish before you call this tool still wake it immediately. One tool call replaces poll loops when driving ssh sessions, containers, or REPLs. Timeout is a success with `timedOut: true`, not an error. Returns no pane content. Targeting mirrors capture-pane (paneId). Any tmux error aborts the wait: a pane that disappeared errors with that message. `timeoutMs` values above the `[watch]` `timeout_max_ms` ceiling are rejected with an error.",
+        annotations(read_only_hint = true),
+        output_schema = rmcp::handler::server::common::schema_for_type::<WaitForPaneChangeOutput>()
+    )]
+    async fn wait_for_pane_change(
+        &self,
+        input: Parameters<WaitForPaneChangeInput>,
+    ) -> Result<CallToolResult, McpError> {
+        if let Err(e) = self.policy.check_tool("wait-for-pane-change") {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        let socket = tmux::resolve_socket(input.0.socket.as_deref());
+        if let Err(e) = self.policy.check_socket(socket.as_deref()) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self.policy.check_pane(&input.0.pane_id) {
+            return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
+        }
+        if let Err(e) = self
+            .enforce_session_for_pane(&input.0.pane_id, socket.as_deref())
+            .await
+        {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Access denied: {e}"
+            ))]));
+        }
+
+        let params =
+            match watch::WaitParams::resolve(input.0.timeout_ms, input.0.stable_ms, &self.watch) {
+                Ok(params) => params,
+                Err(e) => {
+                    return Ok(CallToolResult::error(vec![Content::text(format!(
+                        "Invalid wait parameters: {e}"
+                    ))]))
+                }
+            };
+        // Arm against the interaction anchor (pre-input baseline), falling
+        // back to the current screen when no anchor exists. This closes the
+        // fast-command race: output that landed between the agent's last
+        // input/read and this call still wakes the wait.
+        let anchor = self
+            .anchors
+            .lock()
+            .await
+            .get(&input.0.pane_id, socket.as_deref())
+            .map(|snap| snap.text);
+        let mut source = watch::TmuxPollSource::new(input.0.pane_id.clone(), socket.clone());
+        match watch::wait_for_change(&mut source, &params, anchor).await {
+            Ok(result) => {
+                // Re-anchor at the current screen on every wake (changed or
+                // timed out): repeated waits arm from what the caller just
+                // observed, never re-reporting an already-reported change.
+                // `current.text` is not exposed by `WaitResult`, so recapture
+                // — the wait just proved the pane readable.
+                self.capture_anchor(&input.0.pane_id, socket.as_deref())
+                    .await;
+                let output = WaitForPaneChangeOutput {
+                    pane_id: input.0.pane_id.clone(),
+                    changed: result.outcome == watch::WaitOutcome::Changed,
+                    timed_out: result.outcome == watch::WaitOutcome::TimedOut,
+                    waited_ms: result.waited.as_millis() as u64,
+                    quiet_ms: result.quiet.as_millis() as u64,
+                };
+                Ok(structured_output(&output))
+            }
+            Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
+                "Error waiting for pane change: {e}"
             ))])),
         }
     }
@@ -1938,7 +2091,14 @@ impl TmuxMcpServer {
         )
         .await
         {
-            Ok(pane) => Ok(structured_output(&pane)),
+            Ok(pane) => {
+                // Anchor the newborn pane at its birth screen so a following
+                // wait-for-pane-change (e.g. "wait for the first prompt")
+                // wakes when the shell draws — the pane-birth flavor of the
+                // fast-command race.
+                self.capture_anchor(&pane.id, socket.as_deref()).await;
+                Ok(structured_output(&pane))
+            }
             Err(e) => Ok(CallToolResult::error(vec![Content::text(format!(
                 "Error splitting pane: {e}"
             ))])),
@@ -2044,6 +2204,10 @@ impl TmuxMcpServer {
                 self.tracker
                     .purge_pane(&input.0.pane_id, socket.as_deref())
                     .await;
+                self.anchors
+                    .lock()
+                    .await
+                    .purge_pane(&input.0.pane_id, socket.as_deref());
                 Ok(CallToolResult::success(vec![Content::text(format!(
                     "Pane {} has been killed",
                     input.0.pane_id
@@ -2090,6 +2254,10 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.command) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: tracked wrapper is input — arm before it lands so a
+        // follow-up wait-for-pane-change catches fast completed commands.
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match self
             .tracker
             .execute_command(
@@ -2861,6 +3029,11 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.keys) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: capture the pre-input screen once per call (the
+        // repeat loop below is one key sequence) so a following
+        // wait-for-pane-change arms against what the agent last saw.
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         let repeat_count = input.0.repeat.unwrap_or(1).max(1);
         for _ in 0..repeat_count {
             if let Some(delay) = input.0.delay_ms {
@@ -2958,6 +3131,9 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: arm before the bytes land (see `send-keys`).
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match tmux::send_keys_hex(&input.0.pane_id, &input.0.hex, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Hex bytes sent to pane {}",
@@ -2997,6 +3173,9 @@ impl TmuxMcpServer {
         if let Err(e) = self.policy.check_command(&input.0.content) {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor: arm before the paste lands (see `send-keys`).
+        self.capture_anchor(&input.0.pane_id, socket.as_deref())
+            .await;
         match tmux::paste_text(&input.0.pane_id, &input.0.content, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "Pasted text into pane {}",
@@ -3258,6 +3437,8 @@ impl TmuxMcpServer {
         {
             return Ok(CallToolResult::error(vec![Content::text(format!("{e}"))]));
         }
+        // Input anchor for every special-key tool: arm before the key lands.
+        self.capture_anchor(pane_id, socket.as_deref()).await;
         match tmux::send_keys(pane_id, key, false, socket.as_deref()).await {
             Ok(()) => Ok(CallToolResult::success(vec![Content::text(format!(
                 "{key} sent to pane {pane_id}"
@@ -3713,9 +3894,13 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                 )
                 .await
                 {
-                    Ok(content) => Ok(read_resource_result! {
-                        contents: vec![ResourceContents::text(content, uri)],
-                    }),
+                    Ok(content) => {
+                        // Read anchor: the caller has seen this text.
+                        self.capture_anchor(pane_id, socket.as_deref()).await;
+                        Ok(read_resource_result! {
+                            contents: vec![ResourceContents::text(content, uri)],
+                        })
+                    }
                     Err(e) => Ok(read_resource_result! {
                         contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                     }),
@@ -3745,9 +3930,13 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(read_resource_result! {
-                                contents: vec![ResourceContents::text(content, uri)],
-                            }),
+                            Ok(content) => {
+                                // Read anchor: the caller has seen this text.
+                                self.capture_anchor(pane_id, socket.as_deref()).await;
+                                Ok(read_resource_result! {
+                                    contents: vec![ResourceContents::text(content, uri)],
+                                })
+                            }
                             Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),
@@ -3775,9 +3964,14 @@ impl rmcp::ServerHandler for TmuxMcpServer {
                         )
                         .await
                         {
-                            Ok(content) => Ok(read_resource_result! {
-                                contents: vec![ResourceContents::text(content, uri)],
-                            }),
+                            Ok(content) => {
+                                // Read anchor: the caller has seen this text
+                                // (ANSI variant included).
+                                self.capture_anchor(pane_id, socket.as_deref()).await;
+                                Ok(read_resource_result! {
+                                    contents: vec![ResourceContents::text(content, uri)],
+                                })
+                            }
                             Err(e) => Ok(read_resource_result! {
                                 contents: vec![ResourceContents::text(format!("Error: {e}"), uri)],
                             }),
@@ -5288,6 +5482,120 @@ mod tests {
             .expect("capture pane");
         assert_eq!(result.is_error, Some(true));
         assert!(first_text(&result).contains("Error capturing pane"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_tool_denied_by_policy() {
+        let server = server_with_policy("[security]\nallow_capture = false\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(50),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("wait-for-pane-change"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_pane_gone_errors() {
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_ERROR_CMD", "capture-pane");
+        stub.set_var("TMUX_STUB_ERROR_MSG", "can't find pane: %1");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(2_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("can't find pane"));
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_timeout_is_success() {
+        // Static stub screen: the wait times out successfully with no wake.
+        let mut stub = TmuxStub::new();
+        stub.set_var("TMUX_STUB_CAPTURE_OUTPUT", "static screen");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(80),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(false));
+        let payload: WaitForPaneChangeOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        assert!(!payload.changed);
+        assert!(payload.timed_out);
+        assert!(payload.waited_ms >= 70);
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_wakes_on_screen_change() {
+        // The stub flips its capture output after the first poll.
+        let mut stub = TmuxStub::new();
+        let count_dir = tempfile::TempDir::new().expect("count dir");
+        let count_file = count_dir
+            .path()
+            .join("wait-count")
+            .to_string_lossy()
+            .to_string();
+        stub.set_var("TMUX_STUB_CAPTURE_COUNT_FILE", &count_file);
+        stub.set_var("TMUX_STUB_CAPTURE_BEFORE", "before");
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER", "2");
+        stub.set_var("TMUX_STUB_CAPTURE_AFTER_OUTPUT", "after");
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(5_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(false));
+        let payload: WaitForPaneChangeOutput = serde_json::from_str(&first_text(&result)).unwrap();
+        assert!(payload.changed);
+        assert!(!payload.timed_out);
+    }
+
+    #[tokio::test]
+    async fn wait_for_pane_change_rejects_over_ceiling_timeout() {
+        let _stub = TmuxStub::new();
+        let server = server_with_policy("[security]\nallowed_sessions = [\"%1\"]\n");
+
+        let result = server
+            .wait_for_pane_change(Parameters(WaitForPaneChangeInput {
+                pane_id: "%1".into(),
+                timeout_ms: Some(10_000_000),
+                stable_ms: Some(0),
+                socket: None,
+            }))
+            .await
+            .expect("wait for pane change");
+        assert_eq!(result.is_error, Some(true));
+        let text = first_text(&result);
+        assert!(
+            text.contains("exceeds the configured maximum"),
+            "got: {text}"
+        );
+        assert!(text.contains("600000 ms"));
     }
 
     #[tokio::test]

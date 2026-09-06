@@ -20,6 +20,8 @@ Use this skill when a task needs a real TTY, persistent shell state, or multiple
 - Avoid the fragile loop of send-keys -> send-enter -> capture-pane for routine command output.
 - Do not send interactive keys into a pane while a tracked command is running on it.
 - Use `send-keys` only for interactive programs (REPLs, prompts, TUIs, ssh). Pair it with `capture-pane` in a read-act loop.
+- **Replace capture-poll loops with `wait-for-pane-change`** whenever you would otherwise sleep-and-recapture: it blocks server-side until the pane's displayed text changes since your last interaction with it, and returns no content, so one call covers the whole wait. It arms at the text from your last input or read — a command that finished while you were thinking still wakes it instantly, so you never need to guess whether a command was fast. Timeout returns `timedOut: true` as a success; a disappeared pane returns an error saying so.
+- When driving nested programs (ssh, containers, REPLs), tracked completion is invisible—use `wait-for-pane-change(paneId, timeoutMs, stableMs?)` after sending input, then `capture-pane` once to read the result. Default `stableMs` (250) wakes when output settles; pass `stableMs=0` to wake at the first change (e.g. waiting for a prompt).
 - When key names cannot express a key (escape sequences like CSI-u Shift+Enter), use `send-hex` with raw byte tokens instead of `send-keys`.
 - For multi-line input, use `paste-text` so capable shells/REPLs hold embedded newlines instead of submitting line-by-line. If support is uncertain, `capture-pane` afterward to confirm the block was held.
 - `send-keys` accepts `enter=true` to type and submit in one call, avoiding a separate `send-enter`.
@@ -96,16 +98,23 @@ Use this for prompts, REPLs, ssh, or text UIs.
 
    `paste-text(paneId="<paneId>", content="line1\nline2\n", socket="<socket>")`
 
-3. Confirm the action:
+3. **Wait for the program to respond with a single blocking call** instead of recapturing in a loop (especially over ssh, where the remote command runs *inside* the pane's shell so tracking cannot see it):
 
-   - `capture-pane(paneId="<paneId>", lines=120, join=true, socket="<socket>")`
-   - If you sent keys without `enter=true`, submit with `send-enter(paneId="<paneId>", socket="<socket>")`
+   - For a long-running command: `wait-for-pane-change(paneId="<paneId>", timeoutMs=120000, socket="<socket>")` — wakes when output settles (default `stableMs`).
+   - For a prompt reappearing: `wait-for-pane-change(paneId="<paneId>", timeoutMs=30000, stableMs=0, socket="<socket>")` — wakes at the first change.
+   - `timedOut: true` means the pane stayed quiet — decide whether to keep waiting or investigate.
 
-4. For keys that key names cannot express, send raw bytes. Use `send-hex` for escape sequences such as CSI-u (e.g. Shift+Enter = `1b 5b 31 33 3b 32 75`), which `send-keys` collapses to a plain Enter:
+4. Read the result once:
+
+   `capture-pane(paneId="<paneId>", lines=120, join=true, socket="<socket>")`
+
+   If you sent keys without `enter=true`, submit with `send-enter(paneId="<paneId>", socket="<socket>")`
+
+5. For keys that key names cannot express, send raw bytes. Use `send-hex` for escape sequences such as CSI-u (e.g. Shift+Enter = `1b 5b 31 33 3b 32 75`), which `send-keys` collapses to a plain Enter:
 
    `send-hex(paneId="<paneId>", hex="1b 5b 31 33 3b 32 75", socket="<socket>")`
 
-5. Interrupt or end input streams when needed:
+6. Interrupt or end input streams when needed:
 
    - `send-cancel(paneId="<paneId>", socket="<socket>")`
    - `send-eof(paneId="<paneId>", socket="<socket>")`
@@ -142,5 +151,6 @@ Use this when you need multiple concurrent runners with periodic summaries.
 
 - Reach for tmux MCP when you need interactivity, persistent shell state, or pane-level parallelism.
 - Reach for `execute-command` when you want clean, attributable output and exit codes.
+- Reach for `wait-for-pane-change` when the process is nested inside the pane (ssh, containers, REPLs, TUIs) or when you would otherwise poll captures.
 - Reach for `send-keys` only when the target program expects keystrokes.
 - If a tool call is denied, check the server security configuration and allowed scopes (socket/session/pane restrictions).

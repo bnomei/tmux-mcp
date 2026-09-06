@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::commands::TrackingConfig;
 use crate::errors::{Error, Result};
+use crate::watch::WatchConfig;
 
 const TOOLS_ENV_VAR: &str = "TMUX_MCP_TOOLS";
 const DEFAULT_BUFFER_DIR_NAME: &str = "tmux-mcp-buffers";
@@ -92,6 +93,10 @@ const TOOL_MANIFEST: &[ToolManifestEntry] = &[
     },
     ToolManifestEntry {
         name: "capture-pane",
+        groups: &["capture", "read"],
+    },
+    ToolManifestEntry {
+        name: "wait-for-pane-change",
         groups: &["capture", "read"],
     },
     ToolManifestEntry {
@@ -536,7 +541,7 @@ impl Default for SecurityConfig {
     }
 }
 
-/// Full config.toml schema (shell, ssh, security, tracking, search sections).
+/// Full config.toml schema (shell, ssh, security, tracking, search, watch sections).
 ///
 /// Unknown keys are rejected so typos fail closed at load time rather than
 /// silently disabling policy or tracking budgets.
@@ -558,6 +563,9 @@ pub struct ConfigFile {
     /// When paste-buffer search spills large buffers to temp files.
     #[serde(default)]
     pub search: SearchConfig,
+    /// Poll/timeout/debounce budgets for `wait-for-pane-change`.
+    #[serde(default)]
+    pub watch: WatchConfig,
 }
 
 /// Compiled runtime enforcer for tool, target, path, and command policy checks.
@@ -653,9 +661,17 @@ impl SecurityPolicy {
             | "break-pane"
             | "swap-pane"
             | "set-synchronize-panes" => self.config.allow_move,
-            "capture-pane" | "show-buffer" | "save-buffer" | "load-buffer" | "delete-buffer"
-            | "set-buffer" | "append-buffer" | "rename-buffer" | "search-buffer"
-            | "subsearch-buffer" => self.config.allow_capture,
+            "capture-pane"
+            | "show-buffer"
+            | "save-buffer"
+            | "load-buffer"
+            | "delete-buffer"
+            | "set-buffer"
+            | "append-buffer"
+            | "rename-buffer"
+            | "search-buffer"
+            | "subsearch-buffer"
+            | "wait-for-pane-change" => self.config.allow_capture,
             "socket-for-path"
             | "list-sessions"
             | "list-windows"

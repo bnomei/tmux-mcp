@@ -35,6 +35,7 @@ Use it when an agent needs a real TTY, long-running commands, parallel panes, re
 
 - Session, window, pane, client, and buffer tools with structured inputs and outputs.
 - `execute-command` and `get-command-result` for shell commands with command IDs, resource URIs, status, output, and side-channel exit-code tracking (optional `waitMs`; prefer resource subscribe for completion).
+- `wait-for-pane-change` for blocking on any visible pane change—inside ssh sessions, containers, REPLs, and TUIs where the side-channel tracker cannot see completion.
 - Pane, window, session, client, server, and tracked-command resources for lightweight state checks without re-running tools.
 - Optional raw input tools for interactive programs, prompts, REPLs, and TUIs.
 - Runtime policy controls for tool filtering, command filtering, socket/session/pane scoping, and coarse operation groups.
@@ -318,6 +319,12 @@ tracking_deadline_seconds = 600
 
 [search]
 streaming_threshold_bytes = 262144
+
+[watch]
+poll_interval_ms = 300
+stable_ms = 250
+timeout_default_ms = 30000
+timeout_max_ms = 600000
 ```
 
 ### Security options
@@ -333,7 +340,7 @@ streaming_threshold_bytes = 262144
 | `security.allow_split` | boolean | `true` | Allows `split-pane`. |
 | `security.allow_rename` | boolean | `true` | Allows session, window, and pane rename tools. |
 | `security.allow_move` | boolean | `true` | Allows focus, resize, zoom, layout, join, break, swap, move, and synchronize-panes tools. |
-| `security.allow_capture` | boolean | `true` | Allows `capture-pane` and tmux buffer read, write, and search tools. Buffer file operations are part of this capture surface. |
+| `security.allow_capture` | boolean | `true` | Allows `capture-pane`, `wait-for-pane-change`, and tmux buffer read, write, and search tools. Buffer file operations are part of this capture surface. |
 | `security.allow_list` | boolean | `true` | Allows session, window, pane, client, buffer, and current-session listing tools. |
 | `security.allowed_sockets` | string array or unset | unset | When set, the effective socket for every tool and resource request must exactly match one of these paths. |
 | `security.allowed_sessions` | string array or unset | unset | When set, session-scoped operations are limited to exact tmux session IDs or names in the list. |
@@ -362,6 +369,17 @@ streaming_threshold_bytes = 262144
 | Key | Default | Description |
 | --- | --- | --- |
 | `search.streaming_threshold_bytes` | `262144` | Buffer size threshold where search streams through a temp file instead of loading the full buffer text into one string for the search pass. |
+
+### Watch options
+
+Options for `wait-for-pane-change`, the blocking pane watcher.
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `watch.poll_interval_ms` | `300` over a local socket, `800` when `TMUX_MCP_SSH` is set | Milliseconds between polls of the pane's visible screen. Over SSH each poll is a full ssh exec, hence the longer interval. |
+| `watch.stable_ms` | `250` | Default `stableMs` debounce window: the wake fires once the screen has been stable this long. `0` in a tool call wakes at the first change. |
+| `watch.timeout_default_ms` | `30000` | Default `timeoutMs` when the caller omits it. |
+| `watch.timeout_max_ms` | `600000` | Ceiling for caller-supplied `timeoutMs`. Larger requests are rejected with an error naming the ceiling, not silently clamped. |
 
 ## Security hardening
 
@@ -447,11 +465,11 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | Group | Tools |
 | --- | --- |
 | `@all` | Every known tool compiled into the binary. |
-| `@read` | `socket-for-path`, list/find tools, `capture-pane`, buffer read/search tools, and `get-command-result`. |
+| `@read` | `socket-for-path`, list/find tools, `capture-pane`, `wait-for-pane-change`, buffer read/search tools, and `get-command-result`. |
 | `@socket` | `socket-for-path`. |
 | `@list` | `list-sessions`, `find-session`, `list-windows`, `list-panes`, `list-clients`, `list-buffers`, `get-current-session`. |
 | `@execute` | `execute-command`, `get-command-result`. |
-| `@capture` | `capture-pane`. |
+| `@capture` | `capture-pane`, `wait-for-pane-change`. |
 | `@buffer-read` | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
 | `@buffer-write` | `save-buffer`, `load-buffer`, `delete-buffer`, `set-buffer`, `append-buffer`, `rename-buffer`. |
 | `@create` | `create-session`, `create-window`. |
@@ -470,7 +488,7 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | Socket utility | `socket-for-path` derives a deterministic `/tmp/<hash>.sock` path from a project path. |
 | Session management | `list-sessions`, `find-session`, `create-session`, `kill-session`, `get-current-session`, `rename-session`. |
 | Window management | `list-windows`, `create-window`, `kill-window`, `rename-window`, `move-window`, `select-window`, `select-layout`, `set-synchronize-panes`. |
-| Pane management | `list-panes`, `split-pane`, `kill-pane`, `rename-pane`, `capture-pane`, `select-pane`, `resize-pane`, `zoom-pane`, `join-pane`, `break-pane`, `swap-pane`. |
+| Pane management | `list-panes`, `split-pane`, `kill-pane`, `rename-pane`, `capture-pane`, `wait-for-pane-change`, `select-pane`, `resize-pane`, `zoom-pane`, `join-pane`, `break-pane`, `swap-pane`. |
 | Command execution | `execute-command` returns `commandId` + `resourceUri`; prefer `resources/subscribe` then read on `resources/updated`, or `get-command-result` with `waitMs`. |
 | Client management | `list-clients`, `detach-client`. |
 | Buffer inspection | `list-buffers`, `show-buffer`, `search-buffer`, `subsearch-buffer`. |
@@ -478,6 +496,26 @@ Tool availability depends on Cargo features and runtime policy. Runtime-denied t
 | Raw input | `send-keys`, `paste-text`, `send-hex`, `send-cancel`, `send-eof`, `send-escape`, `send-enter`, `send-tab`, `send-backspace`, `send-up`, `send-down`, `send-left`, `send-right`, `send-page-up`, `send-page-down`, `send-home`, `send-end`. |
 
 Prefer `execute-command` with resource subscribe/read (or `get-command-result` + `waitMs`) for non-interactive commands. Tracked commands queue per pane. Use `capture-pane` for live progress only; do not treat pane DONE markers as authoritative. Use raw input tools only for prompts, REPLs, editors, pagers, and TUIs—and not while a tracked command is running on that pane.
+
+### Waiting for nested or interactive output
+
+`wait-for-pane-change` blocks server-side until the pane's displayed text changes, then returns so the caller can `capture-pane` on its own decision. Use it instead of poll loops when the interesting process is *nested*—ssh sessions, containers, REPLs, editors, test watchers—because the side-channel tracker that powers `execute-command` only sees the pane's shell, not the program inside it.
+
+- The wake predicate is byte-exact visible-screen comparison, mirroring `capture-pane` targeting (`paneId`, same scope). No content is returned; capture afterwards to see what changed.
+- **The baseline is your last interaction with the pane** — the text shown when you last sent input (`send-keys`, `paste-text`, `execute-command`) or read it (`capture-pane`, pane resources). Commands that finish *before* you call the wait still wake it immediately, so there is no need to guess whether a command was fast: send, wait, capture. Each wake re-anchors, so repeated waits on a streaming program report each new change once and never re-report an old one. Metadata tools (`list-panes`, zoom, resize, …) do not anchor: they display no pane text.
+- Timeout is a **success** result with `timedOut: true`—a quiet pane is not an error.
+- Any tmux error aborts the wait: a pane that disappeared returns an error stating the pane is gone.
+- `timeoutMs` values above `[watch]` `timeout_max_ms` (default 600 s) are rejected with an error naming the ceiling.
+- `stableMs` (default 250 ms) debounces bursts: the wake fires once output settles. Pass `stableMs: 0` to wake at the first change—for example, when waiting for a prompt to reappear.
+- Changes in other panes, cursor-only motion, copy-mode scrolling, and title changes do not wake the watcher: only the watched pane's displayed text matters.
+
+Typical flow when driving an ssh session:
+
+1. `send-keys` the remote command into the pane.
+2. `wait-for-pane-change` on that pane with a `timeoutMs` that covers the expected runtime. The wait arms at the screen *before your input*, so a command that already finished wakes it immediately; a slow one blocks as usual.
+3. On wake (or timeout), `capture-pane` to read the result.
+
+One tool call replaces every iteration of "capture, inspect, decide, sleep" in that loop.
 
 Tracked command snapshots use `schemaVersion: 1` and currently move through `queued`, `running`, then `completed`, `failed`, or `tracking_error`. The schema also reserves `cancelled`, but the current tracker does not emit it. Normal tracked commands reject embedded newlines, unquoted shell comment markers (`#`), and unquoted background operators (`&`) because those forms can bypass the tracking epilogue. Set `rawMode=true` or `noEnter=true` only when you intentionally want to disable side-channel completion tracking; those records remain `running`.
 
@@ -571,15 +609,16 @@ The integration tests cover these tmux workflows:
 | ID-first targeting | `list-windows`, `list-panes`, `rename-window`. |
 | Task-per-session layout | `create-session`, `create-window`, `split-pane`, `rename-pane`, list tools. |
 | Stateful shell context | `send-keys`, `capture-pane`. |
-| Continuous output pane | `send-keys`, `capture-pane`. |
-| Interactive prompt automation | `send-keys`, `capture-pane`. |
+| Continuous output pane | `send-keys`, `capture-pane`, `wait-for-pane-change`. |
+| Interactive prompt automation | `send-keys`, `wait-for-pane-change`, `capture-pane`. |
 | Interactive interrupts | `send-cancel`, `send-eof`, `capture-pane`. |
 | Synchronized panes broadcast | `set-synchronize-panes`, `send-keys`, `capture-pane`. |
 | Buffer handoff and search | `list-buffers`, `show-buffer`, `save-buffer`, `delete-buffer`, `search-buffer`, `subsearch-buffer`. |
 | Pane rearrangements | `split-pane`, `select-layout`, `swap-pane`, `break-pane`, `join-pane`. |
 | Metadata and zoom | Rename tools, `zoom-pane`, `resize-pane`, pane/window resources. |
 | Audit-ready context bundle | `execute-command`, `get-command-result`, `capture-pane`. |
-| Agent orchestration | `create-window`, `split-pane`, `execute-command`, `send-keys`, `capture-pane`. |
+| Nested ssh/container/REPL output | `send-keys`, `wait-for-pane-change`, `capture-pane`. |
+| Agent orchestration | `create-window`, `split-pane`, `execute-command`, `send-keys`, `wait-for-pane-change`, `capture-pane`. |
 
 For agent-facing tmux workflows, see:
 
@@ -632,6 +671,7 @@ Release notes and release packaging details live in [CHANGELOG.md](CHANGELOG.md)
 - Command results are socket-bound. `get-command-result` must use the same effective socket as the original `execute-command` call.
 - Tracked command completion uses a private tmux exit buffer + `wait-for` signal, not forgeable pane scrollback. Optional START/DONE lines are for humans/debug only.
 - Interactive `send-keys`/`paste-text` during a tracked run on the same pane is undefined; wait for the command to finish or use another pane.
+- `wait-for-pane-change` polls the visible screen at `[watch]` `poll_interval_ms`, so wake latency is bounded by that interval (300 ms local, 800 ms over SSH by default). It watches the pane's displayed text only: cursor motion, title changes, copy-mode scrolling, and changes in other panes do not wake it. An identical frame from a TUI (for example an idle status screen) is indistinguishable from a quiet pane.
 - End-to-end SSH behavior is manually verified because CI does not provide a remote host.
 
 ## Source anchors
@@ -641,6 +681,7 @@ Release notes and release packaging details live in [CHANGELOG.md](CHANGELOG.md)
 - Security policy and tool groups: [src/security.rs](src/security.rs)
 - Command tracking: [src/commands.rs](src/commands.rs)
 - tmux socket, SSH, and process wrapper behavior: [src/tmux.rs](src/tmux.rs)
+- Blocking pane watcher: [src/watch.rs](src/watch.rs)
 - Public data types: [src/types.rs](src/types.rs)
 - CLI tests: [tests/cli.rs](tests/cli.rs)
 - Integration workflows: [tests/integration.rs](tests/integration.rs)
